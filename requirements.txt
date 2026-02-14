@@ -1,4 +1,2 @@
-ultralytics==8.4.14
 roboflow==1.2.13
-torch==2.10.0
-torchvision==0.25.0
+rfdetr==1.4.2

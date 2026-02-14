@@ -138,6 +138,11 @@ def train_model(dataset_name: str, data_yaml_path: Path, epochs: int = None) -> 
     print(f"   - Data YAML: {data_yaml_path}")
     print(f"{'='*60}\n")
     
+    # Créer explicitement tous les dossiers nécessaires
+    weights_dir = Config.BASE_DIR / "runs" / dataset_name / "train" / "weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    print(f"📁 Dossiers créés: {weights_dir}")
+    
     # Charger le modèle pré-entraîné
     model = YOLO(Config.MODEL_SIZE)
     
@@ -162,12 +167,55 @@ def train_model(dataset_name: str, data_yaml_path: Path, epochs: int = None) -> 
         val=True,           # Validation pendant l'entraînement
     )
     
-    # Chemin vers le meilleur modèle
-    best_model_path = Config.BASE_DIR / "runs" / dataset_name / "train" / "weights" / "best.pt"
-    print(f"\n✅ Entraînement terminé!")
-    print(f"📦 Meilleur modèle sauvegardé: {best_model_path}")
+    # YOLO sauvegarde dans runs/detect/{project}/{name}/weights/
+    # Le chemin réel peut différer de celui configuré
+    weights_dir = Path("runs/detect") / Config.BASE_DIR / "runs" / dataset_name / "train" / "weights"
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    print(f"📁 Dossiers créés: {weights_dir}")
     
-    return str(best_model_path)
+    # Chercher best.pt dans les différents emplacements possibles
+    possible_paths = [
+        weights_dir / "best.pt",  # runs/detect/projet_detection/runs/sanglier/train/weights/best.pt
+        Path("runs/detect") / Config.BASE_DIR / "runs" / dataset_name / "train" / "weights" / "best.pt",
+        Path.cwd() / "runs" / "detect" / str(Config.BASE_DIR) / "runs" / dataset_name / "train" / "weights" / "best.pt",
+    ]
+    
+    # Chercher aussi dans tout le dossier runs/detect
+    runs_detect_dir = Path("runs/detect")
+    if runs_detect_dir.exists():
+        for pt_file in runs_detect_dir.rglob(f"{dataset_name}/**/weights/best.pt"):
+            possible_paths.append(pt_file)
+    
+    best_model_path = None
+    for path in possible_paths:
+        if path.exists():
+            best_model_path = path
+            break
+    
+    if best_model_path:
+        print(f"\n✅ Entraînement terminé!")
+        print(f"📦 Meilleur modèle sauvegardé: {best_model_path}")
+        return str(best_model_path)
+    else:
+        # Chercher last.pt comme fallback
+        for path in possible_paths:
+            last_path = path.parent / "last.pt"
+            if last_path.exists():
+                print(f"\n⚠️  best.pt non trouvé, mais last.pt existe")
+                print(f"📦 Utilisation de last.pt: {last_path}")
+                return str(last_path)
+        
+        # Chercher tout fichier .pt
+        if runs_detect_dir.exists():
+            pt_files = list(runs_detect_dir.rglob("*.pt"))
+            if pt_files:
+                print(f"\n⚠️  best.pt non trouvé, utilisation de: {pt_files[0]}")
+                return str(pt_files[0])
+        
+        raise FileNotFoundError(
+            f"Aucun fichier modèle (.pt) trouvé dans runs/detect/\n"
+            f"L'entraînement a peut-être échoué. Vérifiez les logs ci-dessus."
+        )
 
 
 def evaluate_model(model_path: str, data_yaml_path: Path):
@@ -179,6 +227,16 @@ def evaluate_model(model_path: str, data_yaml_path: Path):
         data_yaml_path: Chemin vers le fichier data.yaml
     """
     print(f"\n📊 Évaluation du modèle: {model_path}")
+    
+    # Vérifier que le fichier modèle existe
+    model_file = Path(model_path)
+    if not model_file.exists():
+        raise FileNotFoundError(
+            f"Le fichier modèle n'existe pas: {model_path}\n"
+            f"L'entraînement a peut-être échoué ou le modèle n'a pas été sauvegardé."
+        )
+    
+    print(f"   ✅ Fichier modèle trouvé: {model_file}")
     
     model = YOLO(model_path)
     results = model.val(data=str(data_yaml_path))
@@ -204,6 +262,15 @@ def export_model(model_path: str, formats: list = None):
     
     print(f"\n📤 Export du modèle vers: {formats}")
     
+    # Vérifier que le fichier modèle existe
+    model_file = Path(model_path)
+    if not model_file.exists():
+        print(f"   ❌ Erreur: Le fichier modèle n'existe pas: {model_path}")
+        print(f"   ⏭️  Export ignoré")
+        return
+    
+    print(f"   ✅ Fichier modèle trouvé: {model_file}")
+    
     model = YOLO(model_path)
     
     for fmt in formats:
@@ -224,6 +291,16 @@ def predict_on_image(model_path: str, image_path: str, save_dir: str = None):
         save_dir: Dossier de sauvegarde des résultats
     """
     print(f"\n🔍 Prédiction sur: {image_path}")
+    
+    # Vérifier que le fichier modèle existe
+    model_file = Path(model_path)
+    if not model_file.exists():
+        raise FileNotFoundError(
+            f"Le fichier modèle n'existe pas: {model_path}\n"
+            f"Vérifiez le chemin du modèle."
+        )
+    
+    print(f"   ✅ Fichier modèle trouvé: {model_file}")
     
     model = YOLO(model_path)
     
