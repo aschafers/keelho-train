@@ -1,0 +1,5 @@
+.env
+datasets/*
+runs/*
+yolo11n.pt
+projet_detection/*
