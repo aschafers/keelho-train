@@ -1973,8 +1973,17 @@ def get_model(model_size: str = None):
     
     return model
 
-def download_dataset_coco(name: str, api_key: str) -> Path:
-    """Télécharge un dataset depuis Roboflow au format COCO"""
+def download_dataset_coco(name: str, api_key: str) -> Optional[Path]:
+    """
+    Télécharge un dataset depuis Roboflow au format COCO
+    
+    Gère automatiquement:
+    - Version non trouvée → utilise la dernière version disponible
+    - Aucune version → skip le dataset avec un warning
+    
+    Returns:
+        Path du dataset ou None si impossible à télécharger
+    """
     if name not in Config.DATASETS:
         available = list(Config.DATASETS.keys())
         raise ValueError(f"Dataset inconnu: {name}. Disponibles: {available}")
@@ -1982,11 +1991,12 @@ def download_dataset_coco(name: str, api_key: str) -> Path:
     dataset_info = Config.DATASETS[name]
     dataset_path = Config.DATASETS_DIR / name
     
+    # Déjà téléchargé ?
     if dataset_path.exists() and any(dataset_path.iterdir()):
         print(f"📁 Dataset '{name}' déjà présent dans {dataset_path}")
         if 'url' in dataset_info:
             print(f"   🔗 URL: {dataset_info['url']}")
-        # Nettoyer les classes vides (même si déjà téléchargé)
+        # Nettoyer les classes vides
         remove_empty_classes_from_dataset(dataset_path)
         show_dataset_stats(dataset_path)
         return dataset_path
@@ -1996,16 +2006,76 @@ def download_dataset_coco(name: str, api_key: str) -> Path:
         print(f"   🔗 URL: {dataset_info['url']}")
     
     rf = Roboflow(api_key=api_key)
-    project = rf.workspace(dataset_info["workspace"]).project(dataset_info["project"])
     
-    dataset = project.version(dataset_info["version"]).download(
-        model_format="coco",
-        location=str(dataset_path)
-    )
+    try:
+        project = rf.workspace(dataset_info["workspace"]).project(dataset_info["project"])
+    except Exception as e:
+        print(f"   ❌ Erreur accès au projet '{dataset_info['workspace']}/{dataset_info['project']}':")
+        print(f"      {e}")
+        print(f"   ⏭️  Dataset '{name}' ignoré")
+        return None
     
-    print(f"✅ Dataset '{name}' téléchargé")
+    # Récupérer la version demandée
+    requested_version = dataset_info["version"]
+    version_to_use = None
     
-    # === NETTOYAGE DES CLASSES VIDES ===
+    try:
+        # Essayer la version demandée
+        version_to_use = project.version(requested_version)
+        print(f"   ✅ Version {requested_version} trouvée")
+    except RuntimeError as e:
+        print(f"   ⚠️  Version {requested_version} non trouvée")
+        
+        # Lister les versions disponibles
+        try:
+            # Récupérer les infos du projet pour voir les versions
+            project_info = project.__dict__
+            versions = []
+            
+            # Essayer de trouver les versions disponibles
+            # Méthode 1: via l'attribut versions si disponible
+            if hasattr(project, 'versions') and project.versions:
+                versions = project.versions
+            
+            # Méthode 2: tester les versions 1 à 20
+            if not versions:
+                print(f"   🔍 Recherche des versions disponibles...")
+                for v in range(1, 21):
+                    try:
+                        test_version = project.version(v)
+                        versions.append(v)
+                    except RuntimeError:
+                        continue
+            
+            if versions:
+                latest_version = max(versions) if isinstance(versions[0], int) else versions[-1]
+                print(f"   📋 Versions disponibles: {versions}")
+                print(f"   🔄 Utilisation de la version {latest_version} à la place")
+                version_to_use = project.version(latest_version)
+            else:
+                print(f"   ❌ Aucune version disponible pour ce projet")
+                print(f"   💡 Créez une version sur: https://app.roboflow.com/{dataset_info['workspace']}/{dataset_info['project']}/generate")
+                print(f"   ⏭️  Dataset '{name}' ignoré")
+                return None
+                
+        except Exception as e2:
+            print(f"   ❌ Impossible de trouver une version alternative: {e2}")
+            print(f"   ⏭️  Dataset '{name}' ignoré")
+            return None
+    
+    # Télécharger
+    try:
+        dataset = version_to_use.download(
+            model_format="coco",
+            location=str(dataset_path)
+        )
+        print(f"   ✅ Dataset '{name}' téléchargé")
+    except Exception as e:
+        print(f"   ❌ Erreur lors du téléchargement: {e}")
+        print(f"   ⏭️  Dataset '{name}' ignoré")
+        return None
+    
+    # Nettoyer les classes vides
     remove_empty_classes_from_dataset(dataset_path)
     
     show_dataset_stats(dataset_path)
