@@ -6,6 +6,12 @@ Modes d'entraînement:
   - single: Un modèle par dataset (défaut)
   - merged: Fusion des datasets → Un seul modèle multi-classes
 
+Fonctionnalités:
+  - Gestion interactive des classes (fusion, renommage)
+  - Validation et correction automatique des category_id COCO
+  - Early stopping
+  - Support multi-GPU
+
 Auteur: Assistant IA
 Date: 2024
 """
@@ -19,7 +25,7 @@ import torch
 import platform
 import time
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 # ============================================================================
 # 1. INSTALLATION DES DÉPENDANCES
@@ -53,6 +59,9 @@ class Config:
     
     # Nom du modèle fusionné (si mode merged)
     MERGED_MODEL_NAME = "merged_model"
+    
+    # Mode interactif (True = demande confirmation pour fusion/renommage)
+    INTERACTIVE_MODE = True
     
     # ========================================================================
     # PARAMÈTRES PAR DÉFAUT (PRODUCTION)
@@ -151,7 +160,572 @@ def load_datasets_from_csv(csv_path: Path) -> dict:
 
 
 # ============================================================================
-# 4. VALIDATION ET CORRECTION DES DATASETS COCO
+# 4. GESTION INTERACTIVE DES CLASSES
+# ============================================================================
+
+def analyze_dataset_classes(dataset_path: Path) -> Dict:
+    """
+    Analyse les classes d'un dataset et compte les images/annotations par classe
+    
+    Returns:
+        {
+            "categories": [{"id": 0, "name": "pig", "images": 3500, "annotations": 5800}, ...],
+            "total_images": 4000,
+            "total_annotations": 6315
+        }
+    """
+    result = {
+        "categories": [],
+        "total_images": 0,
+        "total_annotations": 0
+    }
+    
+    # Collecter les stats de tous les splits
+    all_categories = {}  # id -> {"name": ..., "images": set(), "annotations": 0}
+    all_image_ids = set()
+    
+    for split in ["train", "valid", "test"]:
+        ann_file = dataset_path / split / "_annotations.coco.json"
+        if not ann_file.exists():
+            continue
+        
+        with open(ann_file, 'r') as f:
+            coco = json.load(f)
+        
+        # Initialiser les catégories
+        for cat in coco.get("categories", []):
+            if cat["id"] not in all_categories:
+                all_categories[cat["id"]] = {
+                    "id": cat["id"],
+                    "name": cat["name"],
+                    "images": set(),
+                    "annotations": 0
+                }
+        
+        # Compter les annotations et images par catégorie
+        for ann in coco.get("annotations", []):
+            cat_id = ann["category_id"]
+            if cat_id in all_categories:
+                all_categories[cat_id]["annotations"] += 1
+                # Utiliser un ID unique combinant split et image_id
+                unique_img_id = f"{split}_{ann['image_id']}"
+                all_categories[cat_id]["images"].add(unique_img_id)
+        
+        # Compter les images totales
+        for img in coco.get("images", []):
+            unique_img_id = f"{split}_{img['id']}"
+            all_image_ids.add(unique_img_id)
+        
+        result["total_annotations"] += len(coco.get("annotations", []))
+    
+    result["total_images"] = len(all_image_ids)
+    
+    # Convertir les sets en counts
+    for cat_id, cat_info in all_categories.items():
+        result["categories"].append({
+            "id": cat_info["id"],
+            "name": cat_info["name"],
+            "images": len(cat_info["images"]),
+            "annotations": cat_info["annotations"]
+        })
+    
+    # Trier par ID
+    result["categories"].sort(key=lambda x: x["id"])
+    
+    return result
+
+
+def display_classes_table(dataset_name: str, class_stats: Dict):
+    """
+    Affiche un tableau des classes avec leurs statistiques
+    """
+    categories = class_stats["categories"]
+    
+    print(f"\n{'='*70}")
+    print(f"📦 Dataset: {dataset_name}")
+    print(f"{'='*70}")
+    
+    if not categories:
+        print("   ❌ Aucune classe trouvée!")
+        return
+    
+    # Calculer les largeurs de colonnes
+    max_name_len = max(len(cat["name"]) for cat in categories)
+    max_name_len = max(max_name_len, 10)  # Minimum 10 caractères
+    
+    # En-tête
+    print(f"\n   ┌{'─'*6}┬{'─'*(max_name_len+2)}┬{'─'*10}┬{'─'*14}┐")
+    print(f"   │ {'ID':^4} │ {'Nom':^{max_name_len}} │ {'Images':^8} │ {'Annotations':^12} │")
+    print(f"   ├{'─'*6}┼{'─'*(max_name_len+2)}┼{'─'*10}┼{'─'*14}┤")
+    
+    # Lignes
+    for cat in categories:
+        print(f"   │ {cat['id']:^4} │ {cat['name']:<{max_name_len}} │ {cat['images']:>8} │ {cat['annotations']:>12} │")
+    
+    # Pied
+    print(f"   └{'─'*6}┴{'─'*(max_name_len+2)}┴{'─'*10}┴{'─'*14}┘")
+    
+    # Résumé
+    print(f"\n   📊 Total: {len(categories)} classe(s), {class_stats['total_images']} images, {class_stats['total_annotations']} annotations")
+    
+    # Détecter les problèmes potentiels
+    names_lower = {}
+    duplicates = []
+    for cat in categories:
+        lower_name = cat["name"].lower().strip()
+        if lower_name in names_lower:
+            duplicates.append((names_lower[lower_name], cat["name"]))
+        else:
+            names_lower[lower_name] = cat["name"]
+    
+    if duplicates:
+        print(f"\n   ⚠️  Doublons potentiels détectés:")
+        for name1, name2 in duplicates:
+            print(f"      • '{name1}' ↔ '{name2}'")
+
+
+def get_user_input(prompt: str, default: str = None) -> str:
+    """
+    Récupère l'input utilisateur (compatible SSH)
+    
+    Args:
+        prompt: Message à afficher
+        default: Valeur par défaut si entrée vide
+    
+    Returns:
+        Input de l'utilisateur
+    """
+    if default:
+        full_prompt = f"{prompt} [{default}]: "
+    else:
+        full_prompt = f"{prompt}: "
+    
+    try:
+        response = input(full_prompt).strip()
+        if not response and default:
+            return default
+        return response
+    except EOFError:
+        # En cas de pipe ou redirection
+        if default:
+            return default
+        return ""
+
+
+def get_yes_no(prompt: str, default: bool = False) -> bool:
+    """
+    Demande une confirmation oui/non
+    
+    Args:
+        prompt: Question à poser
+        default: Valeur par défaut (True=oui, False=non)
+    
+    Returns:
+        True si oui, False si non
+    """
+    default_str = "O/n" if default else "o/N"
+    
+    while True:
+        response = get_user_input(f"{prompt} ({default_str})", "").lower()
+        
+        if response == "":
+            return default
+        elif response in ["o", "oui", "y", "yes", "1"]:
+            return True
+        elif response in ["n", "non", "no", "0"]:
+            return False
+        else:
+            print("   ❓ Répondez par 'o' (oui) ou 'n' (non)")
+
+
+def interactive_merge_classes(categories: List[Dict]) -> List[List[int]]:
+    """
+    Demande à l'utilisateur quelles classes fusionner
+    
+    Args:
+        categories: Liste des catégories [{"id": 0, "name": "pig", ...}, ...]
+    
+    Returns:
+        Liste des groupes de fusion [[0, 1], [2, 3], ...]
+        Chaque groupe contient les IDs à fusionner ensemble
+    """
+    if len(categories) <= 1:
+        print("\n   ℹ️  Une seule classe, pas de fusion possible.")
+        return []
+    
+    merge_groups = []
+    remaining_ids = {cat["id"] for cat in categories}
+    id_to_name = {cat["id"]: cat["name"] for cat in categories}
+    
+    print(f"\n{'─'*60}")
+    print("🔀 FUSION DES CLASSES")
+    print(f"{'─'*60}")
+    
+    if not get_yes_no("   Voulez-vous fusionner des classes ?", default=False):
+        return []
+    
+    while True:
+        if len(remaining_ids) <= 1:
+            print("\n   ℹ️  Plus assez de classes à fusionner.")
+            break
+        
+        # Afficher les classes restantes
+        print(f"\n   Classes disponibles:")
+        for cat_id in sorted(remaining_ids):
+            print(f"      ID {cat_id}: {id_to_name[cat_id]}")
+        
+        print(f"\n   💡 Entrez les IDs ou noms des classes à fusionner, séparés par des virgules")
+        print(f"      Exemples: '0,1' ou 'pig,Pig' ou '0,1,2' pour fusionner 3 classes")
+        
+        response = get_user_input("   Classes à fusionner (ou 'q' pour terminer)")
+        
+        if response.lower() in ['q', 'quit', 'fin', '']:
+            break
+        
+        # Parser la réponse
+        ids_to_merge = set()
+        parts = [p.strip() for p in response.split(",")]
+        
+        for part in parts:
+            # Essayer de parser comme ID numérique
+            if part.isdigit():
+                cat_id = int(part)
+                if cat_id in remaining_ids:
+                    ids_to_merge.add(cat_id)
+                else:
+                    print(f"   ⚠️  ID {cat_id} non trouvé ou déjà fusionné")
+            else:
+                # Chercher par nom (case insensitive)
+                found = False
+                for cat_id, name in id_to_name.items():
+                    if name.lower() == part.lower() and cat_id in remaining_ids:
+                        ids_to_merge.add(cat_id)
+                        found = True
+                        break
+                if not found:
+                    print(f"   ⚠️  Classe '{part}' non trouvée ou déjà fusionnée")
+        
+        if len(ids_to_merge) < 2:
+            print("   ❌ Il faut au moins 2 classes pour fusionner")
+            continue
+        
+        # Confirmer la fusion
+        names_to_merge = [f"{id_to_name[i]} (ID:{i})" for i in sorted(ids_to_merge)]
+        print(f"\n   📋 Fusion proposée: {' + '.join(names_to_merge)}")
+        
+        if get_yes_no("   Confirmer cette fusion ?", default=True):
+            merge_groups.append(sorted(ids_to_merge))
+            remaining_ids -= ids_to_merge
+            print(f"   ✅ Fusion enregistrée!")
+            
+            # Demander si autre fusion
+            if len(remaining_ids) >= 2:
+                if not get_yes_no("\n   Effectuer une autre fusion ?", default=False):
+                    break
+            else:
+                break
+        else:
+            print("   ↩️  Fusion annulée")
+    
+    # Résumé des fusions
+    if merge_groups:
+        print(f"\n   {'─'*50}")
+        print(f"   📋 Résumé des fusions ({len(merge_groups)}):")
+        for i, group in enumerate(merge_groups, 1):
+            names = [f"{id_to_name[id]}" for id in group]
+            print(f"      {i}. {' + '.join(names)} → fusionnées")
+    
+    return merge_groups
+
+
+def interactive_rename_classes(categories: List[Dict], merge_groups: List[List[int]]) -> Dict[int, str]:
+    """
+    Demande à l'utilisateur de renommer les classes
+    
+    Affiche clairement le nom actuel (ou les noms fusionnés) pour chaque classe
+    
+    Args:
+        categories: Liste des catégories originales
+        merge_groups: Groupes de fusion [[0, 1], ...]
+    
+    Returns:
+        Dictionnaire {new_id: new_name}
+    """
+    id_to_name = {cat["id"]: cat["name"] for cat in categories}
+    id_to_annotations = {cat["id"]: cat["annotations"] for cat in categories}
+    
+    # Construire la liste des classes finales après fusion
+    # Chaque entrée: {"ids": [0, 1], "names": ["pig", "Pig"], "annotations": 6315}
+    final_classes = []
+    
+    # IDs qui font partie d'une fusion
+    merged_ids = set()
+    for group in merge_groups:
+        merged_ids.update(group)
+        names = [id_to_name[id] for id in group]
+        total_annotations = sum(id_to_annotations.get(id, 0) for id in group)
+        final_classes.append({
+            "ids": group,
+            "names": names,
+            "annotations": total_annotations,
+            "merged": True
+        })
+    
+    # IDs non fusionnés
+    for cat in categories:
+        if cat["id"] not in merged_ids:
+            final_classes.append({
+                "ids": [cat["id"]],
+                "names": [cat["name"]],
+                "annotations": cat["annotations"],
+                "merged": False
+            })
+    
+    # Trier par premier ID
+    final_classes.sort(key=lambda x: x["ids"][0])
+    
+    print(f"\n{'─'*60}")
+    print("✏️  RENOMMAGE DES CLASSES")
+    print(f"{'─'*60}")
+    
+    if not get_yes_no("   Voulez-vous renommer des classes ?", default=False):
+        # Retourner les noms par défaut (premier nom de chaque groupe)
+        renames = {}
+        for new_id, cls in enumerate(final_classes):
+            renames[new_id] = cls["names"][0]
+        return renames
+    
+    renames = {}
+    
+    print(f"\n   💡 Pour chaque classe, entrez le nouveau nom ou appuyez sur Entrée pour garder l'actuel")
+    print(f"   {'─'*50}")
+    
+    for new_id, cls in enumerate(final_classes):
+        if cls["merged"]:
+            # Classe fusionnée - afficher tous les noms d'origine
+            names_str = " + ".join(cls["names"])
+            current_display = f"[FUSIONNÉE: {names_str}]"
+            default_name = cls["names"][0]  # Premier nom par défaut
+        else:
+            # Classe non fusionnée
+            current_display = cls["names"][0]
+            default_name = cls["names"][0]
+        
+        print(f"\n   Classe {new_id}:")
+        print(f"      Nom actuel: {current_display}")
+        print(f"      Annotations: {cls['annotations']}")
+        
+        new_name = get_user_input(f"      Nouveau nom", default=default_name)
+        
+        if new_name != default_name:
+            print(f"      ✅ Renommée: {current_display} → '{new_name}'")
+        else:
+            print(f"      ✓ Conservé: '{new_name}'")
+        
+        renames[new_id] = new_name
+    
+    # Résumé
+    print(f"\n   {'─'*50}")
+    print(f"   📋 Configuration finale des classes:")
+    for new_id, new_name in renames.items():
+        print(f"      ID {new_id}: {new_name}")
+    
+    return renames
+
+
+def apply_class_changes(dataset_path: Path, merge_groups: List[List[int]], renames: Dict[int, str]) -> Dict:
+    """
+    Applique les fusions et renommages au dataset COCO
+    
+    Args:
+        dataset_path: Chemin du dataset
+        merge_groups: Groupes de fusion [[0, 1], ...]
+        renames: Mapping {new_id: new_name}
+    
+    Returns:
+        Dictionnaire avec les infos des classes finales
+    """
+    print(f"\n{'='*70}")
+    print(f"⚙️  APPLICATION DES MODIFICATIONS")
+    print(f"{'='*70}")
+    
+    # Construire le mapping old_id -> new_id
+    old_to_new = {}
+    
+    # D'abord, récupérer tous les IDs originaux
+    original_ids = set()
+    for split in ["train", "valid", "test"]:
+        ann_file = dataset_path / split / "_annotations.coco.json"
+        if ann_file.exists():
+            with open(ann_file, 'r') as f:
+                coco = json.load(f)
+            for cat in coco.get("categories", []):
+                original_ids.add(cat["id"])
+            break
+    
+    # IDs fusionnés
+    merged_ids = set()
+    new_id_counter = 0
+    
+    for group in merge_groups:
+        merged_ids.update(group)
+        for old_id in group:
+            old_to_new[old_id] = new_id_counter
+        new_id_counter += 1
+    
+    # IDs non fusionnés
+    for old_id in sorted(original_ids):
+        if old_id not in merged_ids:
+            old_to_new[old_id] = new_id_counter
+            new_id_counter += 1
+    
+    print(f"   📋 Mapping des IDs:")
+    for old_id, new_id in sorted(old_to_new.items()):
+        new_name = renames.get(new_id, f"class_{new_id}")
+        print(f"      {old_id} → {new_id} ({new_name})")
+    
+    # Appliquer à chaque split
+    for split in ["train", "valid", "test"]:
+        ann_file = dataset_path / split / "_annotations.coco.json"
+        if not ann_file.exists():
+            continue
+        
+        print(f"\n   📁 Traitement de {split}...")
+        
+        with open(ann_file, 'r') as f:
+            coco = json.load(f)
+        
+        # Créer le backup
+        backup_file = ann_file.with_suffix('.json.backup_classes')
+        if not backup_file.exists():
+            shutil.copy(ann_file, backup_file)
+            print(f"      💾 Backup créé: {backup_file.name}")
+        
+        # Nouvelles catégories
+        new_categories = []
+        for new_id, new_name in sorted(renames.items()):
+            new_categories.append({
+                "id": new_id,
+                "name": new_name,
+                "supercategory": ""
+            })
+        
+        # Mettre à jour les annotations
+        updated_count = 0
+        for ann in coco.get("annotations", []):
+            old_cat_id = ann["category_id"]
+            if old_cat_id in old_to_new:
+                ann["category_id"] = old_to_new[old_cat_id]
+                updated_count += 1
+        
+        # Sauvegarder
+        coco["categories"] = new_categories
+        
+        with open(ann_file, 'w') as f:
+            json.dump(coco, f, indent=2)
+        
+        print(f"      ✅ {updated_count} annotations mises à jour")
+        print(f"      ✅ {len(new_categories)} catégories définies")
+    
+    # Retourner les infos des classes finales
+    class_info = {
+        "classes": {},
+        "old_to_new_mapping": old_to_new
+    }
+    
+    for new_id, new_name in renames.items():
+        class_info["classes"][new_id] = {
+            "name": new_name,
+            "supercategory": ""
+        }
+    
+    print(f"\n✅ Modifications appliquées avec succès!")
+    
+    return class_info
+
+
+def interactive_class_management(dataset_path: Path, dataset_name: str) -> Dict:
+    """
+    Gestion interactive complète des classes d'un dataset
+    
+    1. Affiche les stats des classes
+    2. Propose la fusion
+    3. Propose le renommage
+    4. Applique les modifications
+    
+    Args:
+        dataset_path: Chemin du dataset
+        dataset_name: Nom du dataset
+    
+    Returns:
+        Dictionnaire avec les infos des classes finales
+    """
+    if not Config.INTERACTIVE_MODE:
+        # Mode non-interactif: retourner les classes telles quelles
+        categories = extract_classes_from_dataset(dataset_path)
+        return {
+            "classes": {cat["id"]: {"name": cat["name"]} for cat in categories}
+        }
+    
+    # Analyser les classes
+    class_stats = analyze_dataset_classes(dataset_path)
+    
+    # Afficher le tableau
+    display_classes_table(dataset_name, class_stats)
+    
+    categories = class_stats["categories"]
+    
+    if not categories:
+        print("   ❌ Aucune classe trouvée dans le dataset!")
+        return {"classes": {}}
+    
+    # Si une seule classe et pas de problème, passer directement
+    if len(categories) == 1:
+        print(f"\n   ✅ Une seule classe détectée: '{categories[0]['name']}'")
+        if get_yes_no("   Voulez-vous la renommer ?", default=False):
+            new_name = get_user_input(f"   Nouveau nom", default=categories[0]['name'])
+            if new_name != categories[0]['name']:
+                renames = {0: new_name}
+                return apply_class_changes(dataset_path, [], renames)
+        
+        return {
+            "classes": {0: {"name": categories[0]["name"]}}
+        }
+    
+    # Fusion interactive
+    merge_groups = interactive_merge_classes(categories)
+    
+    # Renommage interactif
+    renames = interactive_rename_classes(categories, merge_groups)
+    
+    # Appliquer les modifications si nécessaire
+    if merge_groups or any(renames.get(i) != categories[i]["name"] for i in range(len(categories)) if i < len(renames)):
+        # Vérifier s'il y a vraiment des changements
+        has_changes = bool(merge_groups)
+        
+        if not has_changes:
+            # Vérifier les renommages
+            id_to_name = {cat["id"]: cat["name"] for cat in categories}
+            for new_id, new_name in renames.items():
+                if new_id in id_to_name and id_to_name[new_id] != new_name:
+                    has_changes = True
+                    break
+        
+        if has_changes:
+            print(f"\n{'─'*60}")
+            if get_yes_no("   📝 Appliquer ces modifications au dataset ?", default=True):
+                return apply_class_changes(dataset_path, merge_groups, renames)
+            else:
+                print("   ↩️  Modifications annulées, classes conservées telles quelles")
+    
+    # Pas de changements ou annulé - retourner les classes originales
+    return {
+        "classes": {cat["id"]: {"name": cat["name"]} for cat in categories}
+    }
+
+
+# ============================================================================
+# 5. VALIDATION ET CORRECTION DES DATASETS COCO
 # ============================================================================
 
 def validate_coco_dataset(dataset_path: Path) -> bool:
@@ -340,12 +914,285 @@ def ensure_valid_coco_dataset(dataset_path: Path) -> bool:
 
 
 # ============================================================================
-# 5. FUSION DES DATASETS COCO
+# 6. FUSION DES DATASETS COCO (MODE MERGED)
 # ============================================================================
 
-def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
+def analyze_all_datasets_classes(dataset_paths: List[Path], dataset_names: List[str]) -> Dict:
     """
-    Fusionne plusieurs datasets COCO en un seul avec des category_id valides
+    Analyse les classes de tous les datasets pour le mode merged
+    
+    Returns:
+        {
+            "all_categories": [{"name": "pig", "source": "dataset1", "annotations": 5000}, ...],
+            "by_dataset": {"dataset1": [...], "dataset2": [...]},
+            "unique_names": {"pig", "Pig", "cat", ...}
+        }
+    """
+    result = {
+        "all_categories": [],
+        "by_dataset": {},
+        "unique_names": set()
+    }
+    
+    for dataset_path, dataset_name in zip(dataset_paths, dataset_names):
+        stats = analyze_dataset_classes(dataset_path)
+        result["by_dataset"][dataset_name] = stats["categories"]
+        
+        for cat in stats["categories"]:
+            result["all_categories"].append({
+                "name": cat["name"],
+                "source": dataset_name,
+                "images": cat["images"],
+                "annotations": cat["annotations"],
+                "original_id": cat["id"]
+            })
+            result["unique_names"].add(cat["name"])
+    
+    return result
+
+
+def display_merged_classes_table(all_stats: Dict):
+    """
+    Affiche un tableau consolidé de toutes les classes pour le mode merged
+    """
+    print(f"\n{'='*70}")
+    print(f"📦 CLASSES DE TOUS LES DATASETS (MODE MERGED)")
+    print(f"{'='*70}")
+    
+    all_cats = all_stats["all_categories"]
+    
+    if not all_cats:
+        print("   ❌ Aucune classe trouvée!")
+        return
+    
+    # Calculer les largeurs
+    max_name_len = max(len(cat["name"]) for cat in all_cats)
+    max_name_len = max(max_name_len, 10)
+    max_source_len = max(len(cat["source"]) for cat in all_cats)
+    max_source_len = max(max_source_len, 8)
+    
+    # En-tête
+    print(f"\n   ┌{'─'*(max_name_len+2)}┬{'─'*(max_source_len+2)}┬{'─'*10}┬{'─'*14}┐")
+    print(f"   │ {'Nom':^{max_name_len}} │ {'Source':^{max_source_len}} │ {'Images':^8} │ {'Annotations':^12} │")
+    print(f"   ├{'─'*(max_name_len+2)}┼{'─'*(max_source_len+2)}┼{'─'*10}┼{'─'*14}┤")
+    
+    # Trier par nom pour regrouper les similaires
+    sorted_cats = sorted(all_cats, key=lambda x: (x["name"].lower(), x["source"]))
+    
+    for cat in sorted_cats:
+        print(f"   │ {cat['name']:<{max_name_len}} │ {cat['source']:<{max_source_len}} │ {cat['images']:>8} │ {cat['annotations']:>12} │")
+    
+    print(f"   └{'─'*(max_name_len+2)}┴{'─'*(max_source_len+2)}┴{'─'*10}┴{'─'*14}┘")
+    
+    # Détecter les doublons potentiels
+    names_lower = {}
+    duplicates = []
+    for cat in all_cats:
+        lower_name = cat["name"].lower().strip()
+        key = lower_name
+        if key in names_lower:
+            if names_lower[key] != cat["name"]:
+                duplicates.append((names_lower[key], cat["name"]))
+        else:
+            names_lower[key] = cat["name"]
+    
+    # Détecter les classes avec même nom dans différents datasets
+    name_sources = {}
+    for cat in all_cats:
+        name = cat["name"]
+        if name not in name_sources:
+            name_sources[name] = []
+        name_sources[name].append(cat["source"])
+    
+    shared_classes = {name: sources for name, sources in name_sources.items() if len(sources) > 1}
+    
+    if duplicates:
+        print(f"\n   ⚠️  Doublons potentiels (casse différente):")
+        seen = set()
+        for name1, name2 in duplicates:
+            pair = tuple(sorted([name1, name2]))
+            if pair not in seen:
+                print(f"      • '{name1}' ↔ '{name2}'")
+                seen.add(pair)
+    
+    if shared_classes:
+        print(f"\n   ℹ️  Classes partagées entre datasets:")
+        for name, sources in shared_classes.items():
+            print(f"      • '{name}' dans: {', '.join(sources)}")
+    
+    print(f"\n   📊 Total: {len(all_stats['unique_names'])} nom(s) unique(s), {len(all_cats)} entrée(s)")
+
+
+def interactive_merge_classes_merged_mode(all_stats: Dict) -> Tuple[List[List[str]], Dict[str, str]]:
+    """
+    Gestion interactive des classes en mode merged (plusieurs datasets)
+    
+    Returns:
+        (merge_groups, renames)
+        merge_groups: Liste des groupes de noms à fusionner [["pig", "Pig"], ["cat", "Cat"]]
+        renames: Mapping {old_name: new_name}
+    """
+    all_cats = all_stats["all_categories"]
+    unique_names = list(all_stats["unique_names"])
+    
+    if not unique_names:
+        return [], {}
+    
+    # === FUSION ===
+    print(f"\n{'─'*60}")
+    print("🔀 FUSION DES CLASSES (MODE MERGED)")
+    print(f"{'─'*60}")
+    
+    merge_groups = []
+    remaining_names = set(unique_names)
+    
+    if len(unique_names) > 1 and get_yes_no("   Voulez-vous fusionner des classes ?", default=False):
+        while len(remaining_names) >= 2:
+            print(f"\n   Classes disponibles:")
+            for name in sorted(remaining_names):
+                # Compter les annotations pour ce nom
+                total_ann = sum(c["annotations"] for c in all_cats if c["name"] == name)
+                sources = [c["source"] for c in all_cats if c["name"] == name]
+                print(f"      • '{name}' ({total_ann} ann.) - depuis: {', '.join(sources)}")
+            
+            print(f"\n   💡 Entrez les noms des classes à fusionner, séparés par des virgules")
+            print(f"      Exemple: 'pig,Pig' ou 'cat,Cat,cats'")
+            
+            response = get_user_input("   Classes à fusionner (ou 'q' pour terminer)")
+            
+            if response.lower() in ['q', 'quit', 'fin', '']:
+                break
+            
+            # Parser
+            names_to_merge = set()
+            parts = [p.strip() for p in response.split(",")]
+            
+            for part in parts:
+                # Chercher par nom exact
+                if part in remaining_names:
+                    names_to_merge.add(part)
+                else:
+                    # Chercher case-insensitive
+                    found = False
+                    for name in remaining_names:
+                        if name.lower() == part.lower():
+                            names_to_merge.add(name)
+                            found = True
+                            break
+                    if not found:
+                        print(f"   ⚠️  Classe '{part}' non trouvée ou déjà fusionnée")
+            
+            if len(names_to_merge) < 2:
+                print("   ❌ Il faut au moins 2 classes pour fusionner")
+                continue
+            
+            # Confirmer
+            print(f"\n   📋 Fusion proposée: {' + '.join(sorted(names_to_merge))}")
+            
+            if get_yes_no("   Confirmer ?", default=True):
+                merge_groups.append(sorted(names_to_merge))
+                remaining_names -= names_to_merge
+                print(f"   ✅ Fusion enregistrée!")
+                
+                if len(remaining_names) >= 2:
+                    if not get_yes_no("\n   Autre fusion ?", default=False):
+                        break
+            else:
+                print("   ↩️  Annulé")
+    
+    # === RENOMMAGE ===
+    print(f"\n{'─'*60}")
+    print("✏️  RENOMMAGE DES CLASSES (MODE MERGED)")
+    print(f"{'─'*60}")
+    
+    # Construire la liste finale des classes
+    final_classes = []
+    
+    # Classes fusionnées
+    for group in merge_groups:
+        total_ann = sum(c["annotations"] for c in all_cats if c["name"] in group)
+        final_classes.append({
+            "names": group,
+            "annotations": total_ann,
+            "merged": True
+        })
+    
+    # Classes non fusionnées
+    merged_names = set()
+    for group in merge_groups:
+        merged_names.update(group)
+    
+    for name in sorted(remaining_names):
+        if name not in merged_names:
+            total_ann = sum(c["annotations"] for c in all_cats if c["name"] == name)
+            final_classes.append({
+                "names": [name],
+                "annotations": total_ann,
+                "merged": False
+            })
+    
+    renames = {}
+    
+    if get_yes_no("   Voulez-vous renommer des classes ?", default=False):
+        print(f"\n   💡 Pour chaque classe, entrez le nouveau nom ou Entrée pour conserver")
+        
+        for cls in final_classes:
+            if cls["merged"]:
+                names_str = " + ".join(cls["names"])
+                current_display = f"[FUSIONNÉE: {names_str}]"
+                default_name = cls["names"][0]
+            else:
+                current_display = cls["names"][0]
+                default_name = cls["names"][0]
+            
+            print(f"\n   Classe:")
+            print(f"      Actuel: {current_display}")
+            print(f"      Annotations: {cls['annotations']}")
+            
+            new_name = get_user_input(f"      Nouveau nom", default=default_name)
+            
+            # Stocker le renommage pour tous les noms du groupe
+            for old_name in cls["names"]:
+                renames[old_name] = new_name
+            
+            if new_name != default_name:
+                print(f"      ✅ → '{new_name}'")
+    else:
+        # Pas de renommage - utiliser le premier nom de chaque groupe
+        for cls in final_classes:
+            default_name = cls["names"][0]
+            for old_name in cls["names"]:
+                renames[old_name] = default_name
+    
+    # Résumé
+    print(f"\n   {'─'*50}")
+    print(f"   📋 Configuration finale:")
+    
+    final_names = sorted(set(renames.values()))
+    for i, name in enumerate(final_names):
+        original_names = [k for k, v in renames.items() if v == name]
+        if len(original_names) > 1:
+            print(f"      ID {i}: '{name}' (fusion de: {', '.join(original_names)})")
+        else:
+            print(f"      ID {i}: '{name}'")
+    
+    return merge_groups, renames
+
+
+def merge_coco_datasets(dataset_paths: List[Path], output_path: Path, 
+                        merge_groups: List[List[str]] = None, 
+                        renames: Dict[str, str] = None) -> Dict:
+    """
+    Fusionne plusieurs datasets COCO en un seul
+    
+    Args:
+        dataset_paths: Liste des chemins des datasets
+        output_path: Chemin de sortie
+        merge_groups: Groupes de noms à fusionner (optionnel)
+        renames: Mapping de renommage (optionnel)
+    
+    Returns:
+        Dictionnaire avec le mapping des classes
     """
     print(f"\n{'='*70}")
     print(f"🔀 FUSION DES DATASETS")
@@ -356,14 +1203,26 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
     for dataset_path in dataset_paths:
         ensure_valid_coco_dataset(dataset_path)
     
+    # Construire le mapping des noms -> ID final
+    name_to_final_id = {}
+    final_id_counter = 0
+    
+    if renames:
+        # Utiliser les renommages pour construire le mapping
+        final_names = sorted(set(renames.values()))
+        for final_name in final_names:
+            name_to_final_id[final_name] = final_id_counter
+            final_id_counter += 1
+        
+        # Mapper les anciens noms vers les nouveaux IDs
+        for old_name, new_name in renames.items():
+            name_to_final_id[old_name] = name_to_final_id[new_name]
+    
     merged = {
         "train": {"images": [], "annotations": [], "categories": []},
         "valid": {"images": [], "annotations": [], "categories": []},
         "test": {"images": [], "annotations": [], "categories": []}
     }
-    
-    category_names = {}
-    next_category_id = 0
     
     class_mapping = {
         "classes": {},
@@ -387,54 +1246,51 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
             ann_file = split_dir / "_annotations.coco.json"
             
             if not ann_file.exists():
-                print(f"   ⚠️ {split}: pas de fichier d'annotations")
                 continue
             
             with open(ann_file, 'r') as f:
                 coco_data = json.load(f)
             
-            local_category_map = {}
+            local_id_to_final_id = {}
             
             for cat in coco_data.get("categories", []):
                 cat_name = cat["name"]
                 original_id = cat["id"]
                 
-                if cat_name in category_names:
-                    new_id = category_names[cat_name]
-                    print(f"   📎 Catégorie '{cat_name}' (ID:{original_id}) → ID:{new_id} (existante)")
+                # Déterminer le nom final (après renommage éventuel)
+                final_name = renames.get(cat_name, cat_name) if renames else cat_name
+                
+                # Déterminer l'ID final
+                if final_name in name_to_final_id:
+                    final_id = name_to_final_id[final_name]
                 else:
-                    new_id = next_category_id
-                    category_names[cat_name] = new_id
-                    next_category_id += 1
-                    print(f"   ✨ Catégorie '{cat_name}' (ID:{original_id}) → ID:{new_id} (nouvelle)")
-                    
-                    new_cat = {
-                        "id": new_id,
-                        "name": cat_name,
-                        "supercategory": cat.get("supercategory", "")
-                    }
-                    for s in ["train", "valid", "test"]:
-                        merged[s]["categories"].append(new_cat)
-                    
-                    class_mapping["classes"][new_id] = {
-                        "name": cat_name,
+                    final_id = final_id_counter
+                    name_to_final_id[final_name] = final_id
+                    name_to_final_id[cat_name] = final_id  # Aussi mapper le nom original
+                    final_id_counter += 1
+                
+                local_id_to_final_id[original_id] = final_id
+                
+                print(f"   📎 '{cat_name}' (ID:{original_id}) → '{final_name}' (ID:{final_id})")
+                
+                # Ajouter à class_mapping si nouveau
+                if final_id not in class_mapping["classes"]:
+                    class_mapping["classes"][final_id] = {
+                        "name": final_name,
                         "supercategory": cat.get("supercategory", ""),
                         "source_datasets": [dataset_name]
                     }
-                
-                local_category_map[original_id] = new_id
+                elif dataset_name not in class_mapping["classes"][final_id]["source_datasets"]:
+                    class_mapping["classes"][final_id]["source_datasets"].append(dataset_name)
                 
                 class_mapping["source_datasets"][dataset_name]["original_categories"][original_id] = {
                     "name": cat_name,
-                    "new_id": new_id
+                    "final_name": final_name,
+                    "final_id": final_id
                 }
-                
-                if dataset_name not in class_mapping["classes"].get(new_id, {}).get("source_datasets", []):
-                    if new_id in class_mapping["classes"]:
-                        class_mapping["classes"][new_id]["source_datasets"].append(dataset_name)
             
+            # Images
             local_image_map = {}
-            
             for img in coco_data.get("images", []):
                 old_id = img["id"]
                 new_id = image_id_offset + old_id
@@ -447,11 +1303,12 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
                 
                 merged[split]["images"].append(new_img)
             
+            # Annotations
             for ann in coco_data.get("annotations", []):
                 new_ann = ann.copy()
                 new_ann["id"] = annotation_id_offset + ann["id"]
                 new_ann["image_id"] = local_image_map[ann["image_id"]]
-                new_ann["category_id"] = local_category_map[ann["category_id"]]
+                new_ann["category_id"] = local_id_to_final_id[ann["category_id"]]
                 
                 merged[split]["annotations"].append(new_ann)
                 annotation_id_offset += 1
@@ -461,6 +1318,19 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
             
             print(f"   {split}: {len(coco_data.get('images', []))} images, {len(coco_data.get('annotations', []))} annotations")
     
+    # Créer les catégories finales
+    final_categories = []
+    for final_id, info in sorted(class_mapping["classes"].items()):
+        final_categories.append({
+            "id": final_id,
+            "name": info["name"],
+            "supercategory": info.get("supercategory", "")
+        })
+    
+    for split in ["train", "valid", "test"]:
+        merged[split]["categories"] = final_categories.copy()
+    
+    # Créer le dataset fusionné
     print(f"\n💾 Création du dataset fusionné: {output_path}")
     output_path.mkdir(parents=True, exist_ok=True)
     
@@ -474,7 +1344,8 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
         print(f"   📷 Copie des images {split}...")
         for img in merged[split]["images"]:
             source_dataset = img["source_dataset"]
-            source_file = dataset_paths[list(d.name for d in dataset_paths).index(source_dataset)] / split / img["original_file"]
+            source_idx = [i for i, p in enumerate(dataset_paths) if p.name == source_dataset][0]
+            source_file = dataset_paths[source_idx] / split / img["original_file"]
             
             if source_file.exists():
                 dest_file = split_dir / img["original_file"]
@@ -503,10 +1374,10 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
         
         print(f"   ✅ {split}: {len(merged[split]['images'])} images, {len(merged[split]['annotations'])} annotations")
     
-    print(f"\n📋 Catégories fusionnées ({len(category_names)}):")
-    for name, cat_id in sorted(category_names.items(), key=lambda x: x[1]):
-        sources = class_mapping["classes"][cat_id]["source_datasets"]
-        print(f"   ID {cat_id}: {name} (depuis: {', '.join(sources)})")
+    print(f"\n📋 Catégories fusionnées ({len(final_categories)}):")
+    for cat in final_categories:
+        sources = class_mapping["classes"][cat["id"]]["source_datasets"]
+        print(f"   ID {cat['id']}: {cat['name']} (depuis: {', '.join(sources)})")
     
     # Valider le dataset fusionné
     print("\n🔍 Validation du dataset fusionné...")
@@ -531,7 +1402,7 @@ def extract_classes_from_dataset(dataset_path: Path) -> list:
 
 
 # ============================================================================
-# 6. SAUVEGARDE DU MAPPING DES CLASSES
+# 7. SAUVEGARDE DU MAPPING DES CLASSES
 # ============================================================================
 
 def save_class_mapping(output_dir: Path, class_info: dict, datasets_used: list = None):
@@ -567,7 +1438,7 @@ def save_class_mapping(output_dir: Path, class_info: dict, datasets_used: list =
 
 
 # ============================================================================
-# 7. DÉTECTION ET CONFIGURATION DU DEVICE
+# 8. DÉTECTION ET CONFIGURATION DU DEVICE
 # ============================================================================
 
 def get_available_device() -> str:
@@ -788,15 +1659,12 @@ def _configure_cpu():
 
 
 # ============================================================================
-# 8. AFFICHAGE DE LA CONFIGURATION (GRAND PRINT)
+# 9. AFFICHAGE DE LA CONFIGURATION
 # ============================================================================
 
 def print_full_config_summary(dataset_name: str = None, dataset_path: Path = None, num_classes: int = None):
     """
     Affiche un GRAND résumé complet de la configuration JUSTE AVANT l'entraînement
-    
-    Ce print permet de vérifier que toutes les configurations sont correctes
-    avant de lancer le train.
     """
     
     # Calculs préliminaires
@@ -841,9 +1709,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
     print("█" + " " * 78 + "█")
     print("█" * 80)
     
-    # ═══════════════════════════════════════════════════════════════════════════
     # SECTION 1: DEVICE / GPU
-    # ═══════════════════════════════════════════════════════════════════════════
     print("║")
     print("╠" + "═" * 78 + "╣")
     print("║" + " 🖥️  DEVICE / GPU".ljust(78) + "║")
@@ -854,9 +1720,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
         print(f"║   VRAM disponible:        {gpu_memory:.1f} Go{' ' * 44}║")
     print(f"║   PyTorch version:        {torch.__version__:<50}║")
     
-    # ═══════════════════════════════════════════════════════════════════════════
     # SECTION 2: MODÈLE
-    # ═══════════════════════════════════════════════════════════════════════════
     print("╠" + "═" * 78 + "╣")
     print("║" + " 📦 MODÈLE RF-DETR".ljust(78) + "║")
     print("╠" + "─" * 78 + "╣")
@@ -865,9 +1729,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
     if num_classes:
         print(f"║   Nombre de classes:      {num_classes:<50}║")
     
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION 3: HYPERPARAMÈTRES D'ENTRAÎNEMENT
-    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 3: HYPERPARAMÈTRES
     print("╠" + "═" * 78 + "╣")
     print("║" + " 🏋️  HYPERPARAMÈTRES D'ENTRAÎNEMENT".ljust(78) + "║")
     print("╠" + "─" * 78 + "╣")
@@ -878,9 +1740,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
     print(f"║   Learning rate:          {Config.LR:<50}║")
     print(f"║   Num workers:            {Config.NUM_WORKERS:<50}║")
     
-    # ═══════════════════════════════════════════════════════════════════════════
     # SECTION 4: EARLY STOPPING
-    # ═══════════════════════════════════════════════════════════════════════════
     print("╠" + "═" * 78 + "╣")
     print("║" + " ⏹️  EARLY STOPPING".ljust(78) + "║")
     print("╠" + "─" * 78 + "╣")
@@ -891,9 +1751,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
     else:
         print(f"║   Status:                 ❌ DÉSACTIVÉ{' ' * 39}║")
     
-    # ═══════════════════════════════════════════════════════════════════════════
     # SECTION 5: DATASET
-    # ═══════════════════════════════════════════════════════════════════════════
     print("╠" + "═" * 78 + "╣")
     print("║" + " 📂 DATASET".ljust(78) + "║")
     print("╠" + "─" * 78 + "╣")
@@ -913,17 +1771,16 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
     print(f"║   Fichier CSV:            {str(Config.DATASETS_CSV):<50}║")
     print(f"║   Datasets dans CSV:      {len(Config.DATASETS):<50}║")
     
-    # Liste des datasets avec URLs
+    # Liste des datasets
     print("╠" + "─" * 78 + "╣")
     print("║   📋 Liste des datasets:".ljust(79) + "║")
-    for name, info in list(Config.DATASETS.items())[:10]:  # Max 10
+    for name, info in list(Config.DATASETS.items())[:10]:
         url_icon = "🔗" if 'url' in info else "  "
         line = f"      {url_icon} {name}: {info['workspace']}/{info['project']} v{info['version']}"
         if len(line) > 75:
             line = line[:72] + "..."
         print(f"║{line:<78}║")
         
-        # Afficher l'URL si présente
         if 'url' in info:
             url = info['url']
             if len(url) > 70:
@@ -933,9 +1790,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
     if len(Config.DATASETS) > 10:
         print(f"║      ... et {len(Config.DATASETS) - 10} autres datasets{' ' * 48}║")
     
-    # ═══════════════════════════════════════════════════════════════════════════
-    # SECTION 6: DOSSIERS DE SORTIE
-    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 6: DOSSIERS
     print("╠" + "═" * 78 + "╣")
     print("║" + " 📁 DOSSIERS".ljust(78) + "║")
     print("╠" + "─" * 78 + "╣")
@@ -951,18 +1806,14 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
         output_dir = Config.MODELS_DIR / "output"
     print(f"║   Output:                 {str(output_dir):<50}║")
     
-    # ═══════════════════════════════════════════════════════════════════════════
     # SECTION 7: ESTIMATION
-    # ═══════════════════════════════════════════════════════════════════════════
     print("╠" + "═" * 78 + "╣")
     print("║" + " ⏱️  ESTIMATION".ljust(78) + "║")
     print("╠" + "─" * 78 + "╣")
     print(f"║   Temps par époque:       ~{time_per_epoch} min{' ' * 44}║")
     print(f"║   Temps total estimé:     ~{estimated_time:<48}║")
     
-    # ═══════════════════════════════════════════════════════════════════════════
     # FOOTER
-    # ═══════════════════════════════════════════════════════════════════════════
     print("║" + " " * 78 + "║")
     print("█" * 80)
     print("█" + " " * 78 + "█")
@@ -971,7 +1822,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
     print("█" * 80)
     print("\n")
     
-    # Pause de 3 secondes pour lire
+    # Pause de 3 secondes
     print("⏳ Démarrage dans 3 secondes... (Ctrl+C pour annuler)")
     for i in range(3, 0, -1):
         print(f"   {i}...")
@@ -980,7 +1831,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
 
 
 # ============================================================================
-# 9. FONCTIONS UTILITAIRES
+# 10. FONCTIONS UTILITAIRES
 # ============================================================================
 
 def setup_directories():
@@ -1079,7 +1930,7 @@ def show_dataset_stats(dataset_path: Path):
 
 
 # ============================================================================
-# 10. ENTRAÎNEMENT RF-DETR
+# 11. ENTRAÎNEMENT RF-DETR
 # ============================================================================
 
 def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: int = None) -> str:
@@ -1088,9 +1939,7 @@ def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: 
     """
     epochs = epochs or Config.EPOCHS
     
-    # ══════════════════════════════════════════════════════════════════════════
-    # VALIDATION ET CORRECTION DU DATASET COCO (CRITIQUE!)
-    # ══════════════════════════════════════════════════════════════════════════
+    # VALIDATION DU DATASET COCO
     print(f"\n{'='*70}")
     print(f"🔒 VÉRIFICATION PRÉ-ENTRAÎNEMENT")
     print(f"{'='*70}")
@@ -1098,22 +1947,21 @@ def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: 
     if not ensure_valid_coco_dataset(dataset_path):
         raise ValueError(f"❌ Dataset COCO invalide et impossible à corriger: {dataset_path}")
     
-    # Nombre de classes (re-extraire après correction éventuelle)
+    # Nombre de classes
     categories = extract_classes_from_dataset(dataset_path)
     num_classes = len(categories)
     
     # Mettre à jour class_info avec les IDs corrigés
-    class_info = {"classes": {}}
-    for cat in categories:
-        class_info["classes"][cat['id']] = {
-            'name': cat['name'],
-            'supercategory': cat.get('supercategory', ''),
-            'source_datasets': [model_name]
-        }
+    if not class_info.get("classes"):
+        class_info = {"classes": {}}
+        for cat in categories:
+            class_info["classes"][cat['id']] = {
+                'name': cat['name'],
+                'supercategory': cat.get('supercategory', ''),
+                'source_datasets': [model_name]
+            }
     
-    # ══════════════════════════════════════════════════════════════════════════
-    # AFFICHAGE DU GRAND RÉSUMÉ DE CONFIGURATION
-    # ══════════════════════════════════════════════════════════════════════════
+    # AFFICHAGE DU RÉSUMÉ
     print_full_config_summary(
         dataset_name=model_name,
         dataset_path=dataset_path,
@@ -1212,7 +2060,7 @@ def find_best_model(output_dir: Path) -> Path:
 
 
 # ============================================================================
-# 11. ÉVALUATION ET PRÉDICTION
+# 12. ÉVALUATION ET PRÉDICTION
 # ============================================================================
 
 def evaluate_model(model_path: str, dataset_path: Path) -> dict:
@@ -1354,27 +2202,20 @@ def predict_test(model_path: str = None, image_path: str = None, save_dir: str =
 
 
 # ============================================================================
-# 12. FONCTIONS PRINCIPALES
+# 13. FONCTIONS PRINCIPALES
 # ============================================================================
 
 def train_single_dataset(dataset_name: str):
-    """Pipeline pour un seul dataset"""
+    """Pipeline pour un seul dataset avec gestion interactive des classes"""
     setup_directories()
     
     # Télécharger le dataset
     dataset_path = download_dataset_coco(dataset_name, Config.ROBOFLOW_API_KEY)
     
-    # Extraire les classes (sera re-validé dans train_rfdetr)
-    categories = extract_classes_from_dataset(dataset_path)
-    class_info = {"classes": {}}
-    for cat in categories:
-        class_info["classes"][cat['id']] = {
-            'name': cat['name'],
-            'supercategory': cat.get('supercategory', ''),
-            'source_datasets': [dataset_name]
-        }
+    # Gestion interactive des classes
+    class_info = interactive_class_management(dataset_path, dataset_name)
     
-    # Entraîner (validation + grand print sont fait dans train_rfdetr)
+    # Entraîner
     model_path = train_rfdetr(dataset_path, dataset_name, class_info)
     
     # Évaluer
@@ -1410,17 +2251,26 @@ def train_merged_datasets(dataset_names: List[str] = None):
         path = download_dataset_coco(name, Config.ROBOFLOW_API_KEY)
         dataset_paths.append(path)
     
-    # Fusionner les datasets (inclut validation/correction)
+    # Analyser toutes les classes
+    if Config.INTERACTIVE_MODE:
+        all_stats = analyze_all_datasets_classes(dataset_paths, dataset_names)
+        display_merged_classes_table(all_stats)
+        merge_groups, renames = interactive_merge_classes_merged_mode(all_stats)
+    else:
+        merge_groups = []
+        renames = None
+    
+    # Fusionner les datasets
     merged_path = Config.DATASETS_DIR / Config.MERGED_MODEL_NAME
-    class_info = merge_coco_datasets(dataset_paths, merged_path)
+    class_info = merge_coco_datasets(dataset_paths, merged_path, merge_groups, renames)
     
     # Afficher les stats du dataset fusionné
     show_dataset_stats(merged_path)
     
-    # Entraîner sur le dataset fusionné (validation + grand print dans train_rfdetr)
+    # Entraîner sur le dataset fusionné
     model_path = train_rfdetr(merged_path, Config.MERGED_MODEL_NAME, class_info)
     
-    # Évaluer sur le dataset fusionné
+    # Évaluer
     try:
         evaluate_model(model_path, merged_path)
     except Exception as e:
@@ -1464,7 +2314,7 @@ def train_all_separate():
 
 
 # ============================================================================
-# 13. POINT D'ENTRÉE
+# 14. POINT D'ENTRÉE
 # ============================================================================
 
 if __name__ == "__main__":
@@ -1487,8 +2337,8 @@ Exemples:
   # Configuration personnalisée
   python train_rfdetr.py --api-key CLE --mode merged --resolution 728 --epochs 200
   
-  # Valider un dataset sans entraîner
-  python train_rfdetr.py --validate-only --dataset sanglier
+  # Mode non-interactif (pas de questions)
+  python train_rfdetr.py --api-key CLE --mode merged --no-interactive
 
 Format du fichier CSV (datasets.csv):
   name,workspace,project,version,url
@@ -1497,17 +2347,6 @@ Format du fichier CSV (datasets.csv):
 Modes d'entraînement:
   single  : Un modèle par dataset (défaut)
   merged  : Fusion des datasets → Un seul modèle multi-classes
-
-GPUs supportés:
-  - NVIDIA H200 SXM (141 GB)
-  - NVIDIA H100 (80 GB)
-  - NVIDIA A100 (40/80 GB)
-  - NVIDIA RTX 5090 (32 GB)
-  - NVIDIA RTX 4090 (24 GB)
-  - NVIDIA RTX 5080 (16 GB)
-  - NVIDIA RTX 3090 (24 GB)
-  - Apple Silicon (MPS)
-  - CPU (debug uniquement)
         """
     )
     
@@ -1547,6 +2386,10 @@ GPUs supportés:
     parser.add_argument("--patience", type=int, default=None,
                         help="Patience pour early stopping (défaut: 50)")
     
+    # Mode interactif
+    parser.add_argument("--no-interactive", action="store_true",
+                        help="Désactiver le mode interactif (pas de questions)")
+    
     # Modes spéciaux
     parser.add_argument("--predict", action="store_true",
                         help="Mode prédiction")
@@ -1569,6 +2412,7 @@ GPUs supportés:
     Config.DATASETS_CSV = Path(args.datasets_csv)
     Config.TRAINING_MODE = args.mode
     Config.MERGED_MODEL_NAME = args.model_name
+    Config.INTERACTIVE_MODE = not args.no_interactive
     
     try:
         Config.DATASETS = load_datasets_from_csv(Config.DATASETS_CSV)
@@ -1637,6 +2481,9 @@ GPUs supportés:
         
         if args.dataset:
             dataset_path = download_dataset_coco(args.dataset, Config.ROBOFLOW_API_KEY)
+            # En mode validate-only, on affiche aussi les stats des classes
+            class_stats = analyze_dataset_classes(dataset_path)
+            display_classes_table(args.dataset, class_stats)
             ensure_valid_coco_dataset(dataset_path)
         else:
             for name in Config.DATASETS.keys():
@@ -1644,6 +2491,8 @@ GPUs supportés:
                 print(f"📦 Dataset: {name}")
                 print(f"{'='*70}")
                 dataset_path = download_dataset_coco(name, Config.ROBOFLOW_API_KEY)
+                class_stats = analyze_dataset_classes(dataset_path)
+                display_classes_table(name, class_stats)
                 ensure_valid_coco_dataset(dataset_path)
         exit(0)
     
@@ -1679,6 +2528,7 @@ GPUs supportés:
     # Bannière de démarrage
     device_emoji = "🖥️" if Config.DEVICE.startswith("cuda") else "🍎" if Config.DEVICE == "mps" else "💻"
     mode_emoji = "🔀" if args.mode == "merged" else "📦"
+    interactive_emoji = "💬" if Config.INTERACTIVE_MODE else "🤖"
     
     print("\n")
     print("🐗" * 35)
@@ -1686,6 +2536,7 @@ GPUs supportés:
     print("🐗" + "   RF-DETR TRAINING PIPELINE".center(66) + "🐗")
     print("🐗" + f"   {device_emoji} Device: {Config.DEVICE}".center(66) + "🐗")
     print("🐗" + f"   {mode_emoji} Mode: {args.mode}".center(66) + "🐗")
+    print("🐗" + f"   {interactive_emoji} Interactif: {'Oui' if Config.INTERACTIVE_MODE else 'Non'}".center(66) + "🐗")
     print("🐗" + f"   🎯 Resolution: {Config.RESOLUTION}px".center(66) + "🐗")
     print("🐗" + f"   ⏱️  Epochs: {Config.EPOCHS} (patience: {Config.EARLY_STOPPING_PATIENCE})".center(66) + "🐗")
     print("🐗" + " " * 66 + "🐗")
