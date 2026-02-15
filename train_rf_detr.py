@@ -1134,78 +1134,110 @@ def display_merged_classes_table(all_stats: Dict):
     
     print(f"\n   📊 Total: {len(all_stats['unique_names'])} nom(s) unique(s), {len(all_cats)} entrée(s)")
 
-def interactive_merge_classes_merged_mode(all_stats: Dict) -> Tuple[List[List[str]], Dict[str, str]]:
+def interactive_merge_classes_merged_mode(all_stats: Dict) -> Tuple[List[List[Tuple[str, str]]], Dict[Tuple[str, str], str]]:
     """
     Gestion interactive des classes en mode merged (plusieurs datasets)
     
+    Chaque classe est identifiée par son couple (nom, source) pour permettre
+    de renommer différemment des classes de même nom venant de datasets différents.
+    
     Returns:
         (merge_groups, renames)
-        merge_groups: Liste des groupes de noms à fusionner [["pig", "Pig"], ["cat", "Cat"]]
-        renames: Mapping {old_name: new_name}
+        merge_groups: Liste des groupes à fusionner [[("pig", "ds1"), ("Pig", "ds2")], ...]
+        renames: Mapping {(old_name, source): new_name}
     """
     all_cats = all_stats["all_categories"]
-    unique_names = list(all_stats["unique_names"])
     
-    if not unique_names:
+    if not all_cats:
         return [], {}
+    
+    # Créer une liste de toutes les classes avec leur source (chaque entrée est unique)
+    all_class_entries = []
+    for cat in all_cats:
+        all_class_entries.append({
+            "name": cat["name"],
+            "source": cat["source"],
+            "annotations": cat["annotations"],
+            "images": cat["images"],
+            "key": (cat["name"], cat["source"])  # Clé unique
+        })
     
     # === FUSION ===
     print(f"\n{'─'*60}")
     print("🔀 FUSION DES CLASSES (MODE MERGED)")
     print(f"{'─'*60}")
     
-    merge_groups = []
-    remaining_names = set(unique_names)
+    merge_groups = []  # Liste de groupes, chaque groupe = liste de (name, source)
+    remaining_entries = {entry["key"] for entry in all_class_entries}
     
-    if len(unique_names) > 1 and get_yes_no("   Voulez-vous fusionner des classes ?", default=False):
-        while len(remaining_names) >= 2:
+    if len(all_class_entries) > 1 and get_yes_no("   Voulez-vous fusionner des classes ?", default=False):
+        while len(remaining_entries) >= 2:
             print(f"\n   Classes disponibles:")
-            for name in sorted(remaining_names):
-                # Compter les annotations pour ce nom
-                total_ann = sum(c["annotations"] for c in all_cats if c["name"] == name)
-                sources = [c["source"] for c in all_cats if c["name"] == name]
-                print(f"      • '{name}' ({total_ann} ann.) - depuis: {', '.join(sources)}")
+            # Trier par nom puis par source
+            sorted_remaining = sorted(remaining_entries, key=lambda x: (x[0].lower(), x[1]))
+            for name, source in sorted_remaining:
+                # Trouver les annotations
+                entry = next(e for e in all_class_entries if e["key"] == (name, source))
+                print(f"      • '{name}' [{source}] ({entry['annotations']} ann.)")
             
-            print(f"\n   💡 Entrez les noms des classes à fusionner, séparés par des virgules")
-            print(f"      Exemple: 'pig,Pig' ou 'cat,Cat,cats'")
+            print(f"\n   💡 Entrez les classes à fusionner au format: nom:source")
+            print(f"      Exemple: 'Rat:dataset1,Rat:dataset2' ou 'pig:ds1,Pig:ds2'")
+            print(f"      Ou juste le nom si unique: 'pig,Pig'")
             
             response = get_user_input("   Classes à fusionner (ou 'q' pour terminer)")
             
             if response.lower() in ['q', 'quit', 'fin', '']:
                 break
             
-            # Parser
-            names_to_merge = set()
+            # Parser la réponse
+            entries_to_merge = set()
             parts = [p.strip() for p in response.split(",")]
             
             for part in parts:
-                # Chercher par nom exact
-                if part in remaining_names:
-                    names_to_merge.add(part)
-                else:
-                    # Chercher case-insensitive
+                if ':' in part:
+                    # Format explicite: nom:source
+                    name_part, source_part = part.rsplit(':', 1)
+                    name_part = name_part.strip()
+                    source_part = source_part.strip()
+                    
+                    # Chercher la correspondance
                     found = False
-                    for name in remaining_names:
-                        if name.lower() == part.lower():
-                            names_to_merge.add(name)
+                    for key in remaining_entries:
+                        if key[0].lower() == name_part.lower() and key[1].lower() == source_part.lower():
+                            entries_to_merge.add(key)
                             found = True
                             break
                     if not found:
-                        print(f"   ⚠️  Classe '{part}' non trouvée ou déjà fusionnée")
+                        print(f"   ⚠️  Classe '{name_part}' du dataset '{source_part}' non trouvée")
+                else:
+                    # Format simple: juste le nom
+                    # Chercher toutes les classes avec ce nom
+                    matching = [key for key in remaining_entries if key[0].lower() == part.lower()]
+                    if len(matching) == 0:
+                        print(f"   ⚠️  Classe '{part}' non trouvée")
+                    elif len(matching) == 1:
+                        entries_to_merge.add(matching[0])
+                    else:
+                        # Plusieurs classes avec le même nom - demander précision
+                        print(f"   ⚠️  Plusieurs classes '{part}' trouvées:")
+                        for name, source in matching:
+                            print(f"         • '{name}' [{source}]")
+                        print(f"      Précisez avec le format 'nom:source'")
             
-            if len(names_to_merge) < 2:
+            if len(entries_to_merge) < 2:
                 print("   ❌ Il faut au moins 2 classes pour fusionner")
                 continue
             
             # Confirmer
-            print(f"\n   📋 Fusion proposée: {' + '.join(sorted(names_to_merge))}")
+            merge_display = [f"'{name}' [{source}]" for name, source in sorted(entries_to_merge)]
+            print(f"\n   📋 Fusion proposée: {' + '.join(merge_display)}")
             
             if get_yes_no("   Confirmer ?", default=True):
-                merge_groups.append(sorted(names_to_merge))
-                remaining_names -= names_to_merge
+                merge_groups.append(list(entries_to_merge))
+                remaining_entries -= entries_to_merge
                 print(f"   ✅ Fusion enregistrée!")
                 
-                if len(remaining_names) >= 2:
+                if len(remaining_entries) >= 2:
                     if not get_yes_no("\n   Autre fusion ?", default=False):
                         break
             else:
@@ -1220,41 +1252,47 @@ def interactive_merge_classes_merged_mode(all_stats: Dict) -> Tuple[List[List[st
     final_classes = []
     
     # Classes fusionnées
+    merged_keys = set()
     for group in merge_groups:
-        total_ann = sum(c["annotations"] for c in all_cats if c["name"] in group)
+        total_ann = sum(
+            next(e["annotations"] for e in all_class_entries if e["key"] == key)
+            for key in group
+        )
         final_classes.append({
-            "names": group,
+            "keys": group,  # Liste de (name, source)
             "annotations": total_ann,
             "merged": True
         })
+        merged_keys.update(group)
     
-    # Classes non fusionnées
-    merged_names = set()
-    for group in merge_groups:
-        merged_names.update(group)
-    
-    for name in sorted(remaining_names):
-        if name not in merged_names:
-            total_ann = sum(c["annotations"] for c in all_cats if c["name"] == name)
+    # Classes non fusionnées (chacune séparément!)
+    for entry in all_class_entries:
+        if entry["key"] not in merged_keys:
             final_classes.append({
-                "names": [name],
-                "annotations": total_ann,
+                "keys": [entry["key"]],
+                "annotations": entry["annotations"],
                 "merged": False
             })
     
-    renames = {}
+    # Trier par premier nom
+    final_classes.sort(key=lambda x: (x["keys"][0][0].lower(), x["keys"][0][1]))
+    
+    renames = {}  # {(name, source): new_name}
     
     if get_yes_no("   Voulez-vous renommer des classes ?", default=False):
         print(f"\n   💡 Pour chaque classe, entrez le nouveau nom ou Entrée pour conserver")
         
         for cls in final_classes:
             if cls["merged"]:
-                names_str = " + ".join(cls["names"])
+                # Classe fusionnée - afficher tous les noms/sources d'origine
+                names_str = " + ".join([f"'{name}' [{source}]" for name, source in cls["keys"]])
                 current_display = f"[FUSIONNÉE: {names_str}]"
-                default_name = cls["names"][0]
+                default_name = cls["keys"][0][0]  # Premier nom par défaut
             else:
-                current_display = cls["names"][0]
-                default_name = cls["names"][0]
+                # Classe non fusionnée - afficher nom et source
+                name, source = cls["keys"][0]
+                current_display = f"'{name}' [{source}]"
+                default_name = name
             
             print(f"\n   Classe:")
             print(f"      Actuel: {current_display}")
@@ -1262,45 +1300,56 @@ def interactive_merge_classes_merged_mode(all_stats: Dict) -> Tuple[List[List[st
             
             new_name = get_user_input(f"      Nouveau nom", default=default_name)
             
-            # Stocker le renommage pour tous les noms du groupe
-            for old_name in cls["names"]:
-                renames[old_name] = new_name
+            # Stocker le renommage pour toutes les clés du groupe
+            for key in cls["keys"]:
+                renames[key] = new_name
             
             if new_name != default_name:
                 print(f"      ✅ → '{new_name}'")
     else:
-        # Pas de renommage - utiliser le premier nom de chaque groupe
+        # Pas de renommage interactif
+        # ATTENTION: ici on doit décider quoi faire pour les classes de même nom
+        # Par défaut, on garde le nom original (ce qui fusionnera automatiquement les mêmes noms)
         for cls in final_classes:
-            default_name = cls["names"][0]
-            for old_name in cls["names"]:
-                renames[old_name] = default_name
+            default_name = cls["keys"][0][0]
+            for key in cls["keys"]:
+                renames[key] = default_name
     
     # Résumé
     print(f"\n   {'─'*50}")
     print(f"   📋 Configuration finale:")
     
-    final_names = sorted(set(renames.values()))
-    for i, name in enumerate(final_names):
-        original_names = [k for k, v in renames.items() if v == name]
-        if len(original_names) > 1:
-            print(f"      ID {i}: '{name}' (fusion de: {', '.join(original_names)})")
+    # Regrouper par nom final pour afficher
+    final_names_to_sources = {}
+    for key, new_name in renames.items():
+        if new_name not in final_names_to_sources:
+            final_names_to_sources[new_name] = []
+        final_names_to_sources[new_name].append(key)
+    
+    for i, (final_name, sources) in enumerate(sorted(final_names_to_sources.items())):
+        if len(sources) > 1:
+            sources_str = ", ".join([f"'{n}' [{s}]" for n, s in sources])
+            print(f"      ID {i}: '{final_name}' (fusion de: {sources_str})")
         else:
-            print(f"      ID {i}: '{name}'")
+            name, source = sources[0]
+            if name != final_name:
+                print(f"      ID {i}: '{final_name}' (renommé depuis '{name}' [{source}])")
+            else:
+                print(f"      ID {i}: '{final_name}' [{source}]")
     
     return merge_groups, renames
 
-
 def merge_coco_datasets(dataset_paths: List[Path], output_path: Path, 
-                        merge_groups: List[List[str]] = None, 
-                        renames: Dict[str, str] = None) -> Dict:
+                        merge_groups: List[List[Tuple[str, str]]] = None, 
+                        renames: Dict[Tuple[str, str], str] = None) -> Dict:
     """
     Fusionne plusieurs datasets COCO en un seul
     
     Args:
         dataset_paths: Liste des chemins des datasets
         output_path: Chemin de sortie
-        merge_groups: Groupes de noms à fusionner (optionnel)
-        renames: Mapping de renommage (optionnel)
+        merge_groups: Groupes de (name, source) à fusionner (optionnel)
+        renames: Mapping {(old_name, source): new_name} (optionnel)
     
     Returns:
         Dictionnaire avec le mapping des classes
@@ -1314,20 +1363,26 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path,
     for dataset_path in dataset_paths:
         ensure_valid_coco_dataset(dataset_path)
     
-    # Construire le mapping des noms -> ID final
-    name_to_final_id = {}
+    # Construire le mapping (name, source) -> ID final
+    key_to_final_id = {}  # {(name, source): final_id}
+    final_id_to_name = {}  # {final_id: final_name}
     final_id_counter = 0
     
     if renames:
-        # Utiliser les renommages pour construire le mapping
-        final_names = sorted(set(renames.values()))
-        for final_name in final_names:
-            name_to_final_id[final_name] = final_id_counter
-            final_id_counter += 1
+        # D'abord, regrouper par nom final
+        final_name_to_keys = {}
+        for key, final_name in renames.items():
+            if final_name not in final_name_to_keys:
+                final_name_to_keys[final_name] = []
+            final_name_to_keys[final_name].append(key)
         
-        # Mapper les anciens noms vers les nouveaux IDs
-        for old_name, new_name in renames.items():
-            name_to_final_id[old_name] = name_to_final_id[new_name]
+        # Assigner un ID à chaque nom final unique
+        for final_name in sorted(final_name_to_keys.keys()):
+            keys = final_name_to_keys[final_name]
+            for key in keys:
+                key_to_final_id[key] = final_id_counter
+            final_id_to_name[final_id_counter] = final_name
+            final_id_counter += 1
     
     merged = {
         "train": {"images": [], "annotations": [], "categories": []},
@@ -1367,32 +1422,70 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path,
             for cat in coco_data.get("categories", []):
                 cat_name = cat["name"]
                 original_id = cat["id"]
+                key = (cat_name, dataset_name)
                 
-                # Déterminer le nom final (après renommage éventuel)
-                final_name = renames.get(cat_name, cat_name) if renames else cat_name
-                
-                # Déterminer l'ID final
-                if final_name in name_to_final_id:
-                    final_id = name_to_final_id[final_name]
+                # Déterminer le nom final et l'ID final
+                if renames and key in key_to_final_id:
+                    final_id = key_to_final_id[key]
+                    final_name = final_id_to_name[final_id]
+                elif renames:
+                    # Clé non trouvée dans renames - chercher par nom seul (compatibilité)
+                    # Chercher si une clé avec ce nom existe
+                    found = False
+                    for rkey, rname in renames.items():
+                        if rkey[0] == cat_name:
+                            final_name = rname
+                            if final_name in [final_id_to_name.get(fid) for fid in final_id_to_name]:
+                                final_id = next(fid for fid, fname in final_id_to_name.items() if fname == final_name)
+                            else:
+                                final_id = final_id_counter
+                                final_id_to_name[final_id] = final_name
+                                final_id_counter += 1
+                            key_to_final_id[key] = final_id
+                            found = True
+                            break
+                    
+                    if not found:
+                        # Nouveau nom non renommé
+                        final_name = cat_name
+                        # Vérifier si ce nom final existe déjà
+                        existing_id = next((fid for fid, fname in final_id_to_name.items() if fname == final_name), None)
+                        if existing_id is not None:
+                            final_id = existing_id
+                        else:
+                            final_id = final_id_counter
+                            final_id_to_name[final_id] = final_name
+                            final_id_counter += 1
+                        key_to_final_id[key] = final_id
                 else:
-                    final_id = final_id_counter
-                    name_to_final_id[final_name] = final_id
-                    name_to_final_id[cat_name] = final_id  # Aussi mapper le nom original
-                    final_id_counter += 1
+                    # Pas de renames - utiliser le nom tel quel
+                    final_name = cat_name
+                    # Vérifier si ce nom existe déjà
+                    existing_id = next((fid for fid, fname in final_id_to_name.items() if fname == final_name), None)
+                    if existing_id is not None:
+                        final_id = existing_id
+                    else:
+                        final_id = final_id_counter
+                        final_id_to_name[final_id] = final_name
+                        final_id_counter += 1
+                    key_to_final_id[key] = final_id
                 
                 local_id_to_final_id[original_id] = final_id
                 
-                print(f"   📎 '{cat_name}' (ID:{original_id}) → '{final_name}' (ID:{final_id})")
+                print(f"   📎 '{cat_name}' [{dataset_name}] (ID:{original_id}) → '{final_name}' (ID:{final_id})")
                 
                 # Ajouter à class_mapping si nouveau
                 if final_id not in class_mapping["classes"]:
                     class_mapping["classes"][final_id] = {
                         "name": final_name,
                         "supercategory": cat.get("supercategory", ""),
-                        "source_datasets": [dataset_name]
+                        "source_datasets": [dataset_name],
+                        "original_names": [(cat_name, dataset_name)]
                     }
-                elif dataset_name not in class_mapping["classes"][final_id]["source_datasets"]:
-                    class_mapping["classes"][final_id]["source_datasets"].append(dataset_name)
+                else:
+                    if dataset_name not in class_mapping["classes"][final_id]["source_datasets"]:
+                        class_mapping["classes"][final_id]["source_datasets"].append(dataset_name)
+                    class_mapping["classes"][final_id]["original_names"].append((cat_name, dataset_name))
                 
                 class_mapping["source_datasets"][dataset_name]["original_categories"][original_id] = {
                     "name": cat_name,
@@ -1431,11 +1524,13 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path,
     
     # Créer les catégories finales
     final_categories = []
-    for final_id, info in sorted(class_mapping["classes"].items()):
+    for final_id in sorted(final_id_to_name.keys()):
+        final_name = final_id_to_name[final_id]
+        supercategory = class_mapping["classes"].get(final_id, {}).get("supercategory", "")
         final_categories.append({
             "id": final_id,
-            "name": info["name"],
-            "supercategory": info.get("supercategory", "")
+            "name": final_name,
+            "supercategory": supercategory
         })
     
     for split in ["train", "valid", "test"]:
@@ -1487,15 +1582,26 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path,
     
     print(f"\n📋 Catégories fusionnées ({len(final_categories)}):")
     for cat in final_categories:
-        sources = class_mapping["classes"][cat["id"]]["source_datasets"]
-        print(f"   ID {cat['id']}: {cat['name']} (depuis: {', '.join(sources)})")
+        info = class_mapping["classes"].get(cat["id"], {})
+        sources = info.get("source_datasets", ["?"])
+        original_names = info.get("original_names", [])
+        
+        # Afficher les noms originaux si différents
+        if original_names:
+            unique_originals = list(set(name for name, src in original_names))
+            if len(unique_originals) > 1 or (len(unique_originals) == 1 and unique_originals[0] != cat["name"]):
+                originals_str = ", ".join([f"'{n}' [{s}]" for n, s in original_names])
+                print(f"   ID {cat['id']}: '{cat['name']}' ← [{originals_str}]")
+            else:
+                print(f"   ID {cat['id']}: '{cat['name']}' (depuis: {', '.join(sources)})")
+        else:
+            print(f"   ID {cat['id']}: '{cat['name']}' (depuis: {', '.join(sources)})")
     
     # Valider le dataset fusionné
     print("\n🔍 Validation du dataset fusionné...")
     ensure_valid_coco_dataset(output_path)
     
     return class_mapping
-
 
 def extract_classes_from_dataset(dataset_path: Path) -> list:
     """Extrait les classes depuis le fichier _annotations.coco.json"""
