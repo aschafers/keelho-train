@@ -1700,6 +1700,17 @@ def detect_device_and_optimize(requested_device: str = "auto"):
 
 
 def _configure_cuda(device: str):
+    # ====== OPTIMISATIONS CUDA SÛRES ======
+    # cuDNN benchmark - trouve les meilleurs algorithmes convolutionnels
+    torch.backends.cudnn.benchmark = True
+    
+    # TF32 pour GPUs Ampere+ (H200, A100, RTX 30xx+)
+    # Accélère les calculs matriciels avec précision suffisante
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    print(f"   ⚡ Optimisations CUDA: cuDNN benchmark + TF32 activés")
+    # ======================================
     """Configuration pour GPU NVIDIA"""
     gpu_id = 0 if device == "cuda" else int(device.split(":")[1])
     gpu_name = torch.cuda.get_device_name(gpu_id)
