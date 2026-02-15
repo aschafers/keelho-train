@@ -35,7 +35,100 @@ from typing import Dict, List, Tuple, Optional, Set
 from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRLarge
 from roboflow import Roboflow
 
-
+def remove_empty_classes_from_dataset(dataset_path: Path) -> List[Dict]:
+    """
+    Supprime les classes avec 0 annotations d'un dataset COCO
+    
+    Cette fonction doit être appelée APRÈS le téléchargement et AVANT
+    l'affichage des classes à l'utilisateur.
+    
+    Args:
+        dataset_path: Chemin du dataset
+    
+    Returns:
+        Liste des classes supprimées [{"id": 0, "name": "pig", "source": "..."}, ...]
+    """
+    removed_classes = []
+    
+    for split in ["train", "valid", "test"]:
+        ann_file = dataset_path / split / "_annotations.coco.json"
+        if not ann_file.exists():
+            continue
+        
+        with open(ann_file, 'r') as f:
+            coco = json.load(f)
+        
+        categories = coco.get("categories", [])
+        annotations = coco.get("annotations", [])
+        
+        if not categories:
+            continue
+        
+        # Compter les annotations par catégorie
+        cat_annotation_count = {cat["id"]: 0 for cat in categories}
+        for ann in annotations:
+            cat_id = ann["category_id"]
+            if cat_id in cat_annotation_count:
+                cat_annotation_count[cat_id] += 1
+        
+        # Identifier les catégories vides
+        empty_cat_ids = {cat_id for cat_id, count in cat_annotation_count.items() if count == 0}
+        
+        if not empty_cat_ids:
+            continue
+        
+        # Enregistrer les classes supprimées
+        for cat in categories:
+            if cat["id"] in empty_cat_ids:
+                removed_classes.append({
+                    "id": cat["id"],
+                    "name": cat["name"],
+                    "split": split
+                })
+        
+        # Filtrer les catégories non vides
+        new_categories = [cat for cat in categories if cat["id"] not in empty_cat_ids]
+        
+        # Créer le mapping old_id -> new_id (continu à partir de 0)
+        old_to_new = {}
+        for new_id, cat in enumerate(sorted(new_categories, key=lambda x: x["id"])):
+            old_to_new[cat["id"]] = new_id
+            cat["id"] = new_id
+        
+        # Mettre à jour les annotations
+        for ann in annotations:
+            if ann["category_id"] in old_to_new:
+                ann["category_id"] = old_to_new[ann["category_id"]]
+        
+        # Sauvegarder
+        coco["categories"] = sorted(new_categories, key=lambda x: x["id"])
+        
+        # Backup
+        backup_file = ann_file.with_suffix('.json.backup_before_cleanup')
+        if not backup_file.exists():
+            shutil.copy(ann_file, backup_file)
+        
+        with open(ann_file, 'w') as f:
+            json.dump(coco, f, indent=2)
+    
+    # Afficher le résumé
+    if removed_classes:
+        # Dédupliquer par nom (une classe peut être dans plusieurs splits)
+        unique_removed = {}
+        for cls in removed_classes:
+            if cls["name"] not in unique_removed:
+                unique_removed[cls["name"]] = cls
+        
+        print(f"\n   🧹 {len(unique_removed)} classe(s) vide(s) supprimée(s) automatiquement:")
+        names = [f"'{name}'" for name in sorted(unique_removed.keys())]
+        # Afficher sur plusieurs lignes si beaucoup
+        if len(names) <= 5:
+            print(f"      {', '.join(names)}")
+        else:
+            for i in range(0, len(names), 5):
+                print(f"      {', '.join(names[i:i+5])}")
+    
+    return removed_classes
 # ============================================================================
 # 2. CONFIGURATION
 # ============================================================================
@@ -921,17 +1014,14 @@ def analyze_all_datasets_classes(dataset_paths: List[Path], dataset_names: List[
     """
     Analyse les classes de tous les datasets pour le mode merged
     
-    Returns:
-        {
-            "all_categories": [{"name": "pig", "source": "dataset1", "annotations": 5000}, ...],
-            "by_dataset": {"dataset1": [...], "dataset2": [...]},
-            "unique_names": {"pig", "Pig", "cat", ...}
-        }
+    Note: Les classes vides ont déjà été supprimées lors du téléchargement,
+          mais on filtre quand même par sécurité.
     """
     result = {
         "all_categories": [],
         "by_dataset": {},
-        "unique_names": set()
+        "unique_names": set(),
+        "removed_empty": []  # Pour tracking
     }
     
     for dataset_path, dataset_name in zip(dataset_paths, dataset_names):
@@ -939,6 +1029,14 @@ def analyze_all_datasets_classes(dataset_paths: List[Path], dataset_names: List[
         result["by_dataset"][dataset_name] = stats["categories"]
         
         for cat in stats["categories"]:
+            # Ignorer les classes sans annotations (sécurité supplémentaire)
+            if cat["annotations"] == 0:
+                result["removed_empty"].append({
+                    "name": cat["name"],
+                    "source": dataset_name
+                })
+                continue
+            
             result["all_categories"].append({
                 "name": cat["name"],
                 "source": dataset_name,
@@ -950,16 +1048,15 @@ def analyze_all_datasets_classes(dataset_paths: List[Path], dataset_names: List[
     
     return result
 
-
 def display_merged_classes_table(all_stats: Dict):
     """
     Affiche un tableau consolidé de toutes les classes pour le mode merged
     """
+    all_cats = all_stats["all_categories"]
+    
     print(f"\n{'='*70}")
     print(f"📦 CLASSES DE TOUS LES DATASETS (MODE MERGED)")
     print(f"{'='*70}")
-    
-    all_cats = all_stats["all_categories"]
     
     if not all_cats:
         print("   ❌ Aucune classe trouvée!")
@@ -984,7 +1081,7 @@ def display_merged_classes_table(all_stats: Dict):
     
     print(f"   └{'─'*(max_name_len+2)}┴{'─'*(max_source_len+2)}┴{'─'*10}┴{'─'*14}┘")
     
-    # Détecter les doublons potentiels
+    # Détecter les doublons potentiels (casse différente)
     names_lower = {}
     duplicates = []
     for cat in all_cats:
@@ -1020,8 +1117,22 @@ def display_merged_classes_table(all_stats: Dict):
         for name, sources in shared_classes.items():
             print(f"      • '{name}' dans: {', '.join(sources)}")
     
+    # Afficher les classes vides qui ont été ignorées
+    if all_stats.get("removed_empty"):
+        removed = all_stats["removed_empty"]
+        print(f"\n   🧹 {len(removed)} classe(s) vide(s) ignorée(s) automatiquement:")
+        # Regrouper par nom pour éviter les doublons
+        removed_names = {}
+        for item in removed:
+            name = item['name']
+            if name not in removed_names:
+                removed_names[name] = []
+            removed_names[name].append(item['source'])
+        
+        for name, sources in sorted(removed_names.items()):
+            print(f"      • '{name}' (depuis: {', '.join(sources)})")
+    
     print(f"\n   📊 Total: {len(all_stats['unique_names'])} nom(s) unique(s), {len(all_cats)} entrée(s)")
-
 
 def interactive_merge_classes_merged_mode(all_stats: Dict) -> Tuple[List[List[str]], Dict[str, str]]:
     """
@@ -1862,7 +1973,6 @@ def get_model(model_size: str = None):
     
     return model
 
-
 def download_dataset_coco(name: str, api_key: str) -> Path:
     """Télécharge un dataset depuis Roboflow au format COCO"""
     if name not in Config.DATASETS:
@@ -1876,6 +1986,8 @@ def download_dataset_coco(name: str, api_key: str) -> Path:
         print(f"📁 Dataset '{name}' déjà présent dans {dataset_path}")
         if 'url' in dataset_info:
             print(f"   🔗 URL: {dataset_info['url']}")
+        # Nettoyer les classes vides (même si déjà téléchargé)
+        remove_empty_classes_from_dataset(dataset_path)
         show_dataset_stats(dataset_path)
         return dataset_path
     
@@ -1892,10 +2004,13 @@ def download_dataset_coco(name: str, api_key: str) -> Path:
     )
     
     print(f"✅ Dataset '{name}' téléchargé")
+    
+    # === NETTOYAGE DES CLASSES VIDES ===
+    remove_empty_classes_from_dataset(dataset_path)
+    
     show_dataset_stats(dataset_path)
     
     return dataset_path
-
 
 def show_dataset_stats(dataset_path: Path):
     """Affiche les statistiques du dataset"""
