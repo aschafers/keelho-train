@@ -2417,7 +2417,6 @@ def train_single_dataset(dataset_name: str):
     
     return model_path
 
-
 def train_merged_datasets(dataset_names: List[str] = None):
     """Pipeline pour fusionner et entraîner sur plusieurs datasets"""
     setup_directories()
@@ -2432,13 +2431,33 @@ def train_merged_datasets(dataset_names: List[str] = None):
     
     # Télécharger tous les datasets
     dataset_paths = []
+    successful_names = []
+    failed_names = []
+    
     for name in dataset_names:
         path = download_dataset_coco(name, Config.ROBOFLOW_API_KEY)
-        dataset_paths.append(path)
+        if path is not None:
+            dataset_paths.append(path)
+            successful_names.append(name)
+        else:
+            failed_names.append(name)
     
-    # Analyser toutes les classes
+    # Vérifier qu'on a au moins un dataset
+    if not dataset_paths:
+        print(f"\n❌ Aucun dataset n'a pu être téléchargé!")
+        print(f"   Vérifiez votre fichier CSV et les versions des projets Roboflow")
+        return None
+    
+    # Résumé des téléchargements
+    if failed_names:
+        print(f"\n{'─'*60}")
+        print(f"   ⚠️  {len(failed_names)} dataset(s) ignoré(s): {', '.join(failed_names)}")
+        print(f"   ✅ {len(successful_names)} dataset(s) disponible(s): {', '.join(successful_names)}")
+        print(f"{'─'*60}")
+    
+    # Analyser toutes les classes (avec les listes filtrées!)
     if Config.INTERACTIVE_MODE:
-        all_stats = analyze_all_datasets_classes(dataset_paths, dataset_names)
+        all_stats = analyze_all_datasets_classes(dataset_paths, successful_names)
         display_merged_classes_table(all_stats)
         merge_groups, renames = interactive_merge_classes_merged_mode(all_stats)
     else:
@@ -2468,7 +2487,6 @@ def train_merged_datasets(dataset_names: List[str] = None):
         print(f"⚠️ Erreur prédiction test: {e}")
     
     return model_path
-
 
 def train_all_separate():
     """Entraîne un modèle séparé pour chaque dataset"""
