@@ -2,26 +2,23 @@
 Script d'entraînement RF-DETR pour la détection multi-classes
 Compatible: RunPod (CUDA), Mac M4 Max (MPS), CPU
 
+Modes d'entraînement:
+  - single: Un modèle par dataset (défaut)
+  - merged: Fusion des datasets → Un seul modèle multi-classes
+
 Auteur: Assistant IA
 Date: 2024
-
-Usage:
-    # Sur Mac M4 Max (test rapide)
-    python train_rfdetr.py --api-key VOTRE_CLE --device mps --epochs 1
-    
-    # Sur RunPod (GPU NVIDIA)
-    python train_rfdetr.py --api-key VOTRE_CLE --device cuda
-    
-    # Avec un fichier CSV custom
-    python train_rfdetr.py --api-key VOTRE_CLE --datasets-csv mes_datasets.csv
 """
 
 import os
 from pathlib import Path
 import json
 import csv
+import shutil
 import torch
 import platform
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
 
 # ============================================================================
 # 1. INSTALLATION DES DÉPENDANCES
@@ -50,15 +47,28 @@ class Config:
     # Fichier CSV des datasets (par défaut)
     DATASETS_CSV = Path("datasets.csv")
     
-    # Paramètres par défaut (ajustés selon le device)
+    # Mode d'entraînement: "single" ou "merged"
+    TRAINING_MODE = "single"
+    
+    # Nom du modèle fusionné (si mode merged)
+    MERGED_MODEL_NAME = "merged_model"
+    
+    # ========================================================================
+    # PARAMÈTRES PAR DÉFAUT (PRODUCTION)
+    # ========================================================================
     MODEL_SIZE = "base"
-    EPOCHS = 100
+    EPOCHS = 200
     BATCH_SIZE = 16
     GRAD_ACCUM_STEPS = 1
-    RESOLUTION = 560        # RF-DETR utilise 'resolution' pas 'imgsz'
+    RESOLUTION = 728
     DEVICE = "auto"
     LR = 1e-4
     NUM_WORKERS = 4
+    
+    # Early Stopping
+    EARLY_STOPPING = True
+    EARLY_STOPPING_PATIENCE = 50
+    EARLY_STOPPING_MIN_DELTA = 0.001
     
     # Datasets chargés depuis CSV (dictionnaire)
     DATASETS = {}
@@ -72,24 +82,19 @@ def load_datasets_from_csv(csv_path: Path) -> dict:
     """
     Charge les datasets depuis un fichier CSV
     
-    Format attendu:
-        name,workspace,project,version
-        sanglier,corbin-helms-wghhy,wild-boar-detection-0igwx,1
-        frelon,use-case-asian-hornet-detection,asian-hornet-video-detection,1
-    
-    Args:
-        csv_path: Chemin vers le fichier CSV
+    Format attendu (colonnes obligatoires + optionnelles):
+        name,workspace,project,version,url,notes
+        sanglier,workspace1,project1,1,https://...,Mon commentaire
         
-    Returns:
-        Dictionnaire {name: {workspace, project, version}}
+    Les colonnes 'url', 'notes' et autres sont optionnelles et stockées.
     """
     datasets = {}
     
     if not csv_path.exists():
         print(f"❌ Fichier CSV non trouvé: {csv_path}")
         print(f"   Créez un fichier avec le format:")
-        print(f"   name,workspace,project,version")
-        print(f"   sanglier,corbin-helms-wghhy,wild-boar-detection-0igwx,1")
+        print(f"   name,workspace,project,version,url")
+        print(f"   sanglier,corbin-helms-wghhy,wild-boar-detection-0igwx,1,https://app.roboflow.com/...")
         raise FileNotFoundError(f"Fichier CSV non trouvé: {csv_path}")
     
     print(f"\n📄 Chargement des datasets depuis: {csv_path}")
@@ -97,20 +102,44 @@ def load_datasets_from_csv(csv_path: Path) -> dict:
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         
-        # Vérifier les colonnes requises
+        # Vérifier les colonnes OBLIGATOIRES seulement
         required_columns = {'name', 'workspace', 'project', 'version'}
-        if not required_columns.issubset(set(reader.fieldnames or [])):
-            missing = required_columns - set(reader.fieldnames or [])
-            raise ValueError(f"Colonnes manquantes dans le CSV: {missing}")
+        available_columns = set(reader.fieldnames or [])
+        
+        if not required_columns.issubset(available_columns):
+            missing = required_columns - available_columns
+            raise ValueError(f"Colonnes obligatoires manquantes dans le CSV: {missing}")
+        
+        # Afficher les colonnes détectées
+        optional_columns = available_columns - required_columns
+        if optional_columns:
+            print(f"   📋 Colonnes optionnelles détectées: {optional_columns}")
         
         for row in reader:
             name = row['name'].strip()
+            
+            # Stocker toutes les informations (obligatoires + optionnelles)
             datasets[name] = {
                 'workspace': row['workspace'].strip(),
                 'project': row['project'].strip(),
-                'version': int(row['version'])
+                'version': int(row['version']),
             }
-            print(f"   ✅ {name}: {row['workspace']}/{row['project']} v{row['version']}")
+            
+            # Ajouter les colonnes optionnelles si présentes
+            if 'url' in row and row['url']:
+                datasets[name]['url'] = row['url'].strip()
+            
+            if 'notes' in row and row['notes']:
+                datasets[name]['notes'] = row['notes'].strip()
+            
+            # Stocker toutes les autres colonnes optionnelles
+            for col in optional_columns:
+                if col in row and row[col] and col not in ['url', 'notes']:
+                    datasets[name][col] = row[col].strip()
+            
+            # Affichage
+            url_info = f" 🔗" if 'url' in datasets[name] else ""
+            print(f"   ✅ {name}: {row['workspace']}/{row['project']} v{row['version']}{url_info}")
     
     if not datasets:
         raise ValueError(f"Aucun dataset trouvé dans {csv_path}")
@@ -120,43 +149,175 @@ def load_datasets_from_csv(csv_path: Path) -> dict:
     return datasets
 
 
-def save_class_mapping(output_dir: Path, datasets: dict, class_info: dict):
+# ============================================================================
+# 4. FUSION DES DATASETS COCO
+# ============================================================================
+
+def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
     """
-    Sauvegarde le mapping class_id → dataset/classe dans un fichier JSON
-    
-    Args:
-        output_dir: Dossier du modèle
-        datasets: Dictionnaire des datasets utilisés
-        class_info: Informations sur les classes {class_id: {name, dataset, ...}}
+    Fusionne plusieurs datasets COCO en un seul
     """
-    mapping_file = output_dir / "class_mapping.json"
+    print(f"\n{'='*70}")
+    print(f"🔀 FUSION DES DATASETS")
+    print(f"{'='*70}")
     
-    mapping = {
-        "created_at": str(Path("date")),  # Sera remplacé par datetime
-        "datasets_used": list(datasets.keys()),
-        "classes": class_info,
-        "total_classes": len(class_info)
+    merged = {
+        "train": {"images": [], "annotations": [], "categories": []},
+        "valid": {"images": [], "annotations": [], "categories": []},
+        "test": {"images": [], "annotations": [], "categories": []}
     }
     
-    # Ajouter la date
-    from datetime import datetime
-    mapping["created_at"] = datetime.now().isoformat()
+    category_names = {}
+    next_category_id = 0
     
-    with open(mapping_file, 'w', encoding='utf-8') as f:
-        json.dump(mapping, f, indent=2, ensure_ascii=False)
+    class_mapping = {
+        "classes": {},
+        "source_datasets": {}
+    }
     
-    print(f"💾 Mapping des classes sauvegardé: {mapping_file}")
+    image_id_offset = 0
+    annotation_id_offset = 0
     
-    return mapping_file
+    for dataset_idx, dataset_path in enumerate(dataset_paths):
+        dataset_name = dataset_path.name
+        print(f"\n📁 Traitement: {dataset_name}")
+        
+        class_mapping["source_datasets"][dataset_name] = {
+            "path": str(dataset_path),
+            "original_categories": {}
+        }
+        
+        for split in ["train", "valid", "test"]:
+            split_dir = dataset_path / split
+            ann_file = split_dir / "_annotations.coco.json"
+            
+            if not ann_file.exists():
+                print(f"   ⚠️ {split}: pas de fichier d'annotations")
+                continue
+            
+            with open(ann_file, 'r') as f:
+                coco_data = json.load(f)
+            
+            local_category_map = {}
+            
+            for cat in coco_data.get("categories", []):
+                cat_name = cat["name"]
+                original_id = cat["id"]
+                
+                if cat_name in category_names:
+                    new_id = category_names[cat_name]
+                    print(f"   📎 Catégorie '{cat_name}' (ID:{original_id}) → ID:{new_id} (existante)")
+                else:
+                    new_id = next_category_id
+                    category_names[cat_name] = new_id
+                    next_category_id += 1
+                    print(f"   ✨ Catégorie '{cat_name}' (ID:{original_id}) → ID:{new_id} (nouvelle)")
+                    
+                    new_cat = {
+                        "id": new_id,
+                        "name": cat_name,
+                        "supercategory": cat.get("supercategory", "")
+                    }
+                    for s in ["train", "valid", "test"]:
+                        merged[s]["categories"].append(new_cat)
+                    
+                    class_mapping["classes"][new_id] = {
+                        "name": cat_name,
+                        "supercategory": cat.get("supercategory", ""),
+                        "source_datasets": [dataset_name]
+                    }
+                
+                local_category_map[original_id] = new_id
+                
+                class_mapping["source_datasets"][dataset_name]["original_categories"][original_id] = {
+                    "name": cat_name,
+                    "new_id": new_id
+                }
+                
+                if dataset_name not in class_mapping["classes"].get(new_id, {}).get("source_datasets", []):
+                    if new_id in class_mapping["classes"]:
+                        class_mapping["classes"][new_id]["source_datasets"].append(dataset_name)
+            
+            local_image_map = {}
+            
+            for img in coco_data.get("images", []):
+                old_id = img["id"]
+                new_id = image_id_offset + old_id
+                local_image_map[old_id] = new_id
+                
+                new_img = img.copy()
+                new_img["id"] = new_id
+                new_img["original_file"] = img["file_name"]
+                new_img["source_dataset"] = dataset_name
+                
+                merged[split]["images"].append(new_img)
+            
+            for ann in coco_data.get("annotations", []):
+                new_ann = ann.copy()
+                new_ann["id"] = annotation_id_offset + ann["id"]
+                new_ann["image_id"] = local_image_map[ann["image_id"]]
+                new_ann["category_id"] = local_category_map[ann["category_id"]]
+                
+                merged[split]["annotations"].append(new_ann)
+                annotation_id_offset += 1
+            
+            if coco_data.get("images"):
+                image_id_offset = max(img["id"] for img in merged[split]["images"]) + 1
+            
+            print(f"   {split}: {len(coco_data.get('images', []))} images, {len(coco_data.get('annotations', []))} annotations")
+    
+    print(f"\n💾 Création du dataset fusionné: {output_path}")
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    for split in ["train", "valid", "test"]:
+        split_dir = output_path / split
+        split_dir.mkdir(exist_ok=True)
+        
+        if not merged[split]["images"]:
+            continue
+        
+        print(f"   📷 Copie des images {split}...")
+        for img in merged[split]["images"]:
+            source_dataset = img["source_dataset"]
+            source_file = dataset_paths[list(d.name for d in dataset_paths).index(source_dataset)] / split / img["original_file"]
+            
+            if source_file.exists():
+                dest_file = split_dir / img["original_file"]
+                if dest_file.exists():
+                    base, ext = os.path.splitext(img["original_file"])
+                    new_name = f"{source_dataset}_{base}{ext}"
+                    dest_file = split_dir / new_name
+                    img["file_name"] = new_name
+                else:
+                    img["file_name"] = img["original_file"]
+                
+                shutil.copy2(source_file, dest_file)
+            
+            del img["original_file"]
+            del img["source_dataset"]
+        
+        coco_output = {
+            "images": merged[split]["images"],
+            "annotations": merged[split]["annotations"],
+            "categories": merged[split]["categories"]
+        }
+        
+        ann_file = split_dir / "_annotations.coco.json"
+        with open(ann_file, 'w') as f:
+            json.dump(coco_output, f, indent=2)
+        
+        print(f"   ✅ {split}: {len(merged[split]['images'])} images, {len(merged[split]['annotations'])} annotations")
+    
+    print(f"\n📋 Catégories fusionnées ({len(category_names)}):")
+    for name, cat_id in sorted(category_names.items(), key=lambda x: x[1]):
+        sources = class_mapping["classes"][cat_id]["source_datasets"]
+        print(f"   ID {cat_id}: {name} (depuis: {', '.join(sources)})")
+    
+    return class_mapping
 
 
 def extract_classes_from_dataset(dataset_path: Path) -> list:
-    """
-    Extrait les classes depuis le fichier _annotations.coco.json
-    
-    Returns:
-        Liste des catégories [{id, name, supercategory}, ...]
-    """
+    """Extrait les classes depuis le fichier _annotations.coco.json"""
     categories = []
     
     for split in ["train", "valid", "test"]:
@@ -171,7 +332,43 @@ def extract_classes_from_dataset(dataset_path: Path) -> list:
 
 
 # ============================================================================
-# 4. DÉTECTION ET CONFIGURATION DU DEVICE
+# 5. SAUVEGARDE DU MAPPING DES CLASSES
+# ============================================================================
+
+def save_class_mapping(output_dir: Path, class_info: dict, datasets_used: list = None):
+    """Sauvegarde le mapping class_id → dataset/classe dans un fichier JSON"""
+    mapping_file = output_dir / "class_mapping.json"
+    
+    mapping = {
+        "created_at": datetime.now().isoformat(),
+        "datasets_used": datasets_used or [],
+        "total_classes": len(class_info.get("classes", class_info)),
+        "classes": class_info.get("classes", class_info),
+        "training_config": {
+            "resolution": Config.RESOLUTION,
+            "epochs": Config.EPOCHS,
+            "model_size": Config.MODEL_SIZE,
+            "early_stopping": Config.EARLY_STOPPING,
+            "early_stopping_patience": Config.EARLY_STOPPING_PATIENCE,
+            "batch_size": Config.BATCH_SIZE,
+            "grad_accum_steps": Config.GRAD_ACCUM_STEPS,
+            "learning_rate": Config.LR,
+        }
+    }
+    
+    if "source_datasets" in class_info:
+        mapping["source_datasets"] = class_info["source_datasets"]
+    
+    with open(mapping_file, 'w', encoding='utf-8') as f:
+        json.dump(mapping, f, indent=2, ensure_ascii=False)
+    
+    print(f"💾 Mapping des classes sauvegardé: {mapping_file}")
+    
+    return mapping_file
+
+
+# ============================================================================
+# 6. DÉTECTION ET CONFIGURATION DU DEVICE
 # ============================================================================
 
 def get_available_device() -> str:
@@ -187,19 +384,18 @@ def get_available_device() -> str:
 def detect_device_and_optimize(requested_device: str = "auto"):
     """Détecte le device et ajuste les paramètres"""
     
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"🖥️  DÉTECTION DU MATÉRIEL")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
     
     print(f"   OS: {platform.system()} {platform.release()}")
     print(f"   Python: {platform.python_version()}")
     print(f"   PyTorch: {torch.__version__}")
     
-    # Déterminer le device
     if requested_device == "auto":
         device = get_available_device()
         print(f"   Device demandé: auto → {device}")
-    elif requested_device in ["0", "1", "2", "3"]:
+    elif requested_device in ["0", "1", "2", "3", "4", "5", "6", "7"]:
         device = f"cuda:{requested_device}"
         print(f"   Device demandé: GPU {requested_device}")
     else:
@@ -208,25 +404,12 @@ def detect_device_and_optimize(requested_device: str = "auto"):
     
     Config.DEVICE = device
     
-    # Configuration selon le device
     if device.startswith("cuda"):
         _configure_cuda(device)
     elif device == "mps":
         _configure_mps()
     else:
         _configure_cpu()
-    
-    # Afficher la configuration
-    print(f"\n📊 Configuration finale:")
-    print(f"   {'─'*40}")
-    print(f"   Device:           {Config.DEVICE}")
-    print(f"   Modèle:           RF-DETR-{Config.MODEL_SIZE.capitalize()}")
-    print(f"   Batch size:       {Config.BATCH_SIZE}")
-    print(f"   Grad accum:       {Config.GRAD_ACCUM_STEPS}")
-    print(f"   Resolution:       {Config.RESOLUTION}")
-    print(f"   Learning rate:    {Config.LR:.2e}")
-    print(f"   Num workers:      {Config.NUM_WORKERS}")
-    print(f"   {'─'*40}")
 
 
 def _configure_cuda(device: str):
@@ -239,38 +422,135 @@ def _configure_cuda(device: str):
     print(f"   GPU: {gpu_name}")
     print(f"   Mémoire: {gpu_memory:.1f} Go")
     
-    if "A100" in gpu_name:
-        Config.BATCH_SIZE = 16 if gpu_memory > 70 else 8
-        Config.GRAD_ACCUM_STEPS = 1 if gpu_memory > 70 else 2
+    # NVIDIA H200 SXM (141 GB HBM3e)
+    if "H200" in gpu_name:
+        Config.BATCH_SIZE = 32
+        Config.GRAD_ACCUM_STEPS = 1
         Config.MODEL_SIZE = "large"
+        Config.RESOLUTION = 728
+        Config.NUM_WORKERS = 16
+        print(f"   → Configuration H200 SXM (141 GB)")
+    
+    # NVIDIA H100 (80 GB)
     elif "H100" in gpu_name:
         Config.BATCH_SIZE = 16
         Config.GRAD_ACCUM_STEPS = 1
         Config.MODEL_SIZE = "large"
+        Config.RESOLUTION = 728
+        Config.NUM_WORKERS = 12
+        print(f"   → Configuration H100 (80 GB)")
+    
+    # NVIDIA A100 (40/80 GB)
+    elif "A100" in gpu_name:
+        if gpu_memory > 70:
+            Config.BATCH_SIZE = 16
+            Config.GRAD_ACCUM_STEPS = 1
+        else:
+            Config.BATCH_SIZE = 8
+            Config.GRAD_ACCUM_STEPS = 2
+        Config.MODEL_SIZE = "large"
+        Config.RESOLUTION = 728
+        Config.NUM_WORKERS = 12
+        print(f"   → Configuration A100 ({int(gpu_memory)} GB)")
+    
+    # NVIDIA RTX 5090 (32 GB GDDR7)
+    elif "5090" in gpu_name:
+        Config.BATCH_SIZE = 16
+        Config.GRAD_ACCUM_STEPS = 1
+        Config.MODEL_SIZE = "large"
+        Config.RESOLUTION = 728
+        Config.NUM_WORKERS = 12
+        print(f"   → Configuration RTX 5090 (32 GB GDDR7)")
+    
+    # NVIDIA RTX 4090 (24 GB)
     elif "4090" in gpu_name:
         Config.BATCH_SIZE = 8
         Config.GRAD_ACCUM_STEPS = 2
         Config.MODEL_SIZE = "base"
+        Config.RESOLUTION = 728
+        Config.NUM_WORKERS = 8
+        print(f"   → Configuration RTX 4090 (24 GB)")
+    
+    # NVIDIA RTX 5080 (16 GB GDDR7)
+    elif "5080" in gpu_name:
+        Config.BATCH_SIZE = 8
+        Config.GRAD_ACCUM_STEPS = 2
+        Config.MODEL_SIZE = "base"
+        Config.RESOLUTION = 728
+        Config.NUM_WORKERS = 8
+        print(f"   → Configuration RTX 5080 (16 GB GDDR7)")
+    
+    # NVIDIA RTX 3090/3090 Ti (24 GB)
     elif "3090" in gpu_name:
         Config.BATCH_SIZE = 4
         Config.GRAD_ACCUM_STEPS = 4
         Config.MODEL_SIZE = "base"
+        Config.RESOLUTION = 728
+        Config.NUM_WORKERS = 8
+        print(f"   → Configuration RTX 3090 (24 GB)")
+    
+    # NVIDIA RTX 4080 (16 GB)
+    elif "4080" in gpu_name:
+        Config.BATCH_SIZE = 4
+        Config.GRAD_ACCUM_STEPS = 4
+        Config.MODEL_SIZE = "base"
+        Config.RESOLUTION = 640
+        Config.NUM_WORKERS = 8
+        print(f"   → Configuration RTX 4080 (16 GB)")
+    
+    # NVIDIA RTX 3080 (10/12 GB)
+    elif "3080" in gpu_name:
+        Config.BATCH_SIZE = 4
+        Config.GRAD_ACCUM_STEPS = 4
+        Config.MODEL_SIZE = "small"
+        Config.RESOLUTION = 640
+        Config.NUM_WORKERS = 8
+        print(f"   → Configuration RTX 3080 ({int(gpu_memory)} GB)")
+    
+    # Configuration générique basée sur la VRAM
     else:
-        if gpu_memory > 20:
+        if gpu_memory >= 80:
+            Config.BATCH_SIZE = 16
+            Config.GRAD_ACCUM_STEPS = 1
+            Config.MODEL_SIZE = "large"
+            Config.RESOLUTION = 728
+            Config.NUM_WORKERS = 12
+            print(f"   → Configuration GPU haute capacité ({int(gpu_memory)} GB)")
+        elif gpu_memory >= 32:
+            Config.BATCH_SIZE = 16
+            Config.GRAD_ACCUM_STEPS = 1
+            Config.MODEL_SIZE = "large"
+            Config.RESOLUTION = 728
+            Config.NUM_WORKERS = 12
+            print(f"   → Configuration GPU 32+ GB ({int(gpu_memory)} GB)")
+        elif gpu_memory >= 20:
             Config.BATCH_SIZE = 8
             Config.GRAD_ACCUM_STEPS = 2
             Config.MODEL_SIZE = "base"
-        elif gpu_memory > 10:
+            Config.RESOLUTION = 728
+            Config.NUM_WORKERS = 8
+            print(f"   → Configuration GPU 20+ GB ({int(gpu_memory)} GB)")
+        elif gpu_memory >= 12:
             Config.BATCH_SIZE = 4
             Config.GRAD_ACCUM_STEPS = 4
-            Config.MODEL_SIZE = "small"
-        else:
+            Config.MODEL_SIZE = "base"
+            Config.RESOLUTION = 640
+            Config.NUM_WORKERS = 8
+            print(f"   → Configuration GPU 12+ GB ({int(gpu_memory)} GB)")
+        elif gpu_memory >= 8:
             Config.BATCH_SIZE = 2
             Config.GRAD_ACCUM_STEPS = 8
+            Config.MODEL_SIZE = "small"
+            Config.RESOLUTION = 560
+            Config.NUM_WORKERS = 4
+            print(f"   → Configuration GPU 8+ GB ({int(gpu_memory)} GB)")
+        else:
+            Config.BATCH_SIZE = 1
+            Config.GRAD_ACCUM_STEPS = 16
             Config.MODEL_SIZE = "nano"
-    
-    Config.RESOLUTION = 560
-    Config.NUM_WORKERS = 8
+            Config.RESOLUTION = 480
+            Config.NUM_WORKERS = 2
+            print(f"   → Configuration GPU < 8 GB ({int(gpu_memory)} GB)")
 
 
 def _configure_mps():
@@ -278,10 +558,8 @@ def _configure_mps():
     print(f"\n   🍎 APPLE SILICON (MPS)")
     print(f"   Chip: {platform.processor()}")
     
-    # Activer le fallback CPU pour les opérations non supportées
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
     print(f"   ⚠️  PYTORCH_ENABLE_MPS_FALLBACK=1 (ops non supportées → CPU)")
-    print(f"   → Configuration Mac (test/développement)")
     
     Config.MODEL_SIZE = "nano"
     Config.BATCH_SIZE = 4
@@ -289,6 +567,10 @@ def _configure_mps():
     Config.RESOLUTION = 640
     Config.NUM_WORKERS = 0
     Config.LR = 1e-4
+    Config.EPOCHS = 50
+    Config.EARLY_STOPPING_PATIENCE = 15
+    
+    print(f"   → Configuration Mac (test/développement)")
 
 
 def _configure_cpu():
@@ -302,10 +584,205 @@ def _configure_cpu():
     Config.RESOLUTION = 480
     Config.NUM_WORKERS = 0
     Config.LR = 1e-4
+    Config.EPOCHS = 10
+    Config.EARLY_STOPPING_PATIENCE = 5
 
 
 # ============================================================================
-# 5. FONCTIONS UTILITAIRES
+# 7. AFFICHAGE DE LA CONFIGURATION (GRAND PRINT)
+# ============================================================================
+
+def print_full_config_summary(dataset_name: str = None, dataset_path: Path = None, num_classes: int = None):
+    """
+    Affiche un GRAND résumé complet de la configuration JUSTE AVANT l'entraînement
+    
+    Ce print permet de vérifier que toutes les configurations sont correctes
+    avant de lancer le train.
+    """
+    
+    # Calculs préliminaires
+    effective_batch = Config.BATCH_SIZE * Config.GRAD_ACCUM_STEPS
+    
+    # Estimation du temps
+    if Config.DEVICE.startswith("cuda"):
+        gpu_id = 0 if Config.DEVICE == "cuda" else int(Config.DEVICE.split(":")[1])
+        gpu_name = torch.cuda.get_device_name(gpu_id)
+        gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory / (1024**3)
+        
+        if "H200" in gpu_name or "H100" in gpu_name:
+            time_per_epoch = 1
+        elif "5090" in gpu_name or "A100" in gpu_name:
+            time_per_epoch = 2
+        elif "4090" in gpu_name:
+            time_per_epoch = 3
+        elif "3090" in gpu_name or "5080" in gpu_name:
+            time_per_epoch = 4
+        else:
+            time_per_epoch = 5
+        
+        estimated_time = f"{Config.EPOCHS * time_per_epoch} min"
+        if Config.EARLY_STOPPING:
+            estimated_time += f" (max, early stop activé)"
+    elif Config.DEVICE == "mps":
+        gpu_name = "Apple Silicon"
+        gpu_memory = 0
+        time_per_epoch = 10
+        estimated_time = f"{Config.EPOCHS * time_per_epoch} min"
+    else:
+        gpu_name = "CPU"
+        gpu_memory = 0
+        time_per_epoch = 60
+        estimated_time = f"{Config.EPOCHS * time_per_epoch} min (très lent!)"
+    
+    # Affichage
+    print("\n")
+    print("█" * 80)
+    print("█" + " " * 78 + "█")
+    print("█" + "🚀 CONFIGURATION FINALE AVANT ENTRAÎNEMENT 🚀".center(78) + "█")
+    print("█" + " " * 78 + "█")
+    print("█" * 80)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 1: DEVICE / GPU
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("║")
+    print("╠" + "═" * 78 + "╣")
+    print("║" + " 🖥️  DEVICE / GPU".ljust(78) + "║")
+    print("╠" + "─" * 78 + "╣")
+    print(f"║   Device sélectionné:     {Config.DEVICE:<50}║")
+    print(f"║   GPU/Chip:               {gpu_name:<50}║")
+    if gpu_memory > 0:
+        print(f"║   VRAM disponible:        {gpu_memory:.1f} Go{' ' * 44}║")
+    print(f"║   PyTorch version:        {torch.__version__:<50}║")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 2: MODÈLE
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("╠" + "═" * 78 + "╣")
+    print("║" + " 📦 MODÈLE RF-DETR".ljust(78) + "║")
+    print("╠" + "─" * 78 + "╣")
+    print(f"║   Taille du modèle:       RF-DETR-{Config.MODEL_SIZE.upper():<44}║")
+    print(f"║   Résolution:             {Config.RESOLUTION} x {Config.RESOLUTION} pixels{' ' * 35}║")
+    if num_classes:
+        print(f"║   Nombre de classes:      {num_classes:<50}║")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 3: HYPERPARAMÈTRES D'ENTRAÎNEMENT
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("╠" + "═" * 78 + "╣")
+    print("║" + " 🏋️  HYPERPARAMÈTRES D'ENTRAÎNEMENT".ljust(78) + "║")
+    print("╠" + "─" * 78 + "╣")
+    print(f"║   Époques (max):          {Config.EPOCHS:<50}║")
+    print(f"║   Batch size:             {Config.BATCH_SIZE:<50}║")
+    print(f"║   Gradient accumulation:  {Config.GRAD_ACCUM_STEPS:<50}║")
+    print(f"║   ➡️  Batch effectif:      {effective_batch} (batch × grad_accum){' ' * 26}║")
+    print(f"║   Learning rate:          {Config.LR:<50}║")
+    print(f"║   Num workers:            {Config.NUM_WORKERS:<50}║")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 4: EARLY STOPPING
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("╠" + "═" * 78 + "╣")
+    print("║" + " ⏹️  EARLY STOPPING".ljust(78) + "║")
+    print("╠" + "─" * 78 + "╣")
+    if Config.EARLY_STOPPING:
+        print(f"║   Status:                 ✅ ACTIVÉ{' ' * 42}║")
+        print(f"║   Patience:               {Config.EARLY_STOPPING_PATIENCE} époques sans amélioration{' ' * 23}║")
+        print(f"║   Min delta:              {Config.EARLY_STOPPING_MIN_DELTA}{' ' * 47}║")
+    else:
+        print(f"║   Status:                 ❌ DÉSACTIVÉ{' ' * 39}║")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 5: DATASET
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("╠" + "═" * 78 + "╣")
+    print("║" + " 📂 DATASET".ljust(78) + "║")
+    print("╠" + "─" * 78 + "╣")
+    
+    mode_str = "MERGED (fusion)" if Config.TRAINING_MODE == "merged" else "SINGLE (séparé)"
+    print(f"║   Mode:                   {mode_str:<50}║")
+    
+    if dataset_name:
+        print(f"║   Nom:                    {dataset_name:<50}║")
+    
+    if dataset_path:
+        path_str = str(dataset_path)
+        if len(path_str) > 48:
+            path_str = "..." + path_str[-45:]
+        print(f"║   Chemin:                 {path_str:<50}║")
+    
+    print(f"║   Fichier CSV:            {str(Config.DATASETS_CSV):<50}║")
+    print(f"║   Datasets dans CSV:      {len(Config.DATASETS):<50}║")
+    
+    # Liste des datasets avec URLs
+    print("╠" + "─" * 78 + "╣")
+    print("║   📋 Liste des datasets:".ljust(79) + "║")
+    for name, info in list(Config.DATASETS.items())[:10]:  # Max 10
+        url_icon = "🔗" if 'url' in info else "  "
+        line = f"      {url_icon} {name}: {info['workspace']}/{info['project']} v{info['version']}"
+        if len(line) > 75:
+            line = line[:72] + "..."
+        print(f"║{line:<78}║")
+        
+        # Afficher l'URL si présente
+        if 'url' in info:
+            url = info['url']
+            if len(url) > 70:
+                url = url[:67] + "..."
+            print(f"║         ↳ {url:<67}║")
+    
+    if len(Config.DATASETS) > 10:
+        print(f"║      ... et {len(Config.DATASETS) - 10} autres datasets{' ' * 48}║")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 6: DOSSIERS DE SORTIE
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("╠" + "═" * 78 + "╣")
+    print("║" + " 📁 DOSSIERS".ljust(78) + "║")
+    print("╠" + "─" * 78 + "╣")
+    print(f"║   Base:                   {str(Config.BASE_DIR):<50}║")
+    print(f"║   Datasets:               {str(Config.DATASETS_DIR):<50}║")
+    print(f"║   Models:                 {str(Config.MODELS_DIR):<50}║")
+    
+    if Config.TRAINING_MODE == "merged":
+        output_dir = Config.MODELS_DIR / Config.MERGED_MODEL_NAME
+    elif dataset_name:
+        output_dir = Config.MODELS_DIR / dataset_name
+    else:
+        output_dir = Config.MODELS_DIR / "output"
+    print(f"║   Output:                 {str(output_dir):<50}║")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SECTION 7: ESTIMATION
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("╠" + "═" * 78 + "╣")
+    print("║" + " ⏱️  ESTIMATION".ljust(78) + "║")
+    print("╠" + "─" * 78 + "╣")
+    print(f"║   Temps par époque:       ~{time_per_epoch} min{' ' * 44}║")
+    print(f"║   Temps total estimé:     ~{estimated_time:<48}║")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FOOTER
+    # ═══════════════════════════════════════════════════════════════════════════
+    print("║" + " " * 78 + "║")
+    print("█" * 80)
+    print("█" + " " * 78 + "█")
+    print("█" + "⚡ VÉRIFIEZ LA CONFIGURATION CI-DESSUS AVANT DE CONTINUER ⚡".center(78) + "█")
+    print("█" + " " * 78 + "█")
+    print("█" * 80)
+    print("\n")
+    
+    # Pause de 3 secondes pour lire
+    import time
+    print("⏳ Démarrage dans 3 secondes... (Ctrl+C pour annuler)")
+    for i in range(3, 0, -1):
+        print(f"   {i}...")
+        time.sleep(1)
+    print("🚀 C'est parti !\n")
+
+
+# ============================================================================
+# 8. FONCTIONS UTILITAIRES
 # ============================================================================
 
 def setup_directories():
@@ -348,10 +825,14 @@ def download_dataset_coco(name: str, api_key: str) -> Path:
     
     if dataset_path.exists() and any(dataset_path.iterdir()):
         print(f"📁 Dataset '{name}' déjà présent dans {dataset_path}")
+        if 'url' in dataset_info:
+            print(f"   🔗 URL: {dataset_info['url']}")
         show_dataset_stats(dataset_path)
         return dataset_path
     
     print(f"\n📥 Téléchargement du dataset '{name}' au format COCO...")
+    if 'url' in dataset_info:
+        print(f"   🔗 URL: {dataset_info['url']}")
     
     rf = Roboflow(api_key=api_key)
     project = rf.workspace(dataset_info["workspace"]).project(dataset_info["project"])
@@ -372,6 +853,9 @@ def show_dataset_stats(dataset_path: Path):
     print(f"\n📊 Statistiques du dataset:")
     
     categories = []
+    total_images = 0
+    total_annotations = 0
+    
     for split in ["train", "valid", "test"]:
         split_dir = dataset_path / split
         if split_dir.exists():
@@ -382,105 +866,79 @@ def show_dataset_stats(dataset_path: Path):
                 with open(ann_file, 'r') as f:
                     coco = json.load(f)
                 num_annotations = len(coco.get("annotations", []))
-                categories = [c["name"] for c in coco.get("categories", [])]
+                categories = coco.get("categories", [])
+                total_annotations += num_annotations
             else:
                 num_annotations = "?"
             
+            total_images += len(images)
             print(f"   {split:6s}: {len(images):5d} images, {num_annotations:5} annotations")
     
     if categories:
-        print(f"   Classes: {categories}")
+        print(f"   Classes ({len(categories)}): {[c['name'] for c in categories]}")
+    
+    return {"images": total_images, "annotations": total_annotations, "categories": categories}
 
 
 # ============================================================================
-# 6. ENTRAÎNEMENT RF-DETR
+# 9. ENTRAÎNEMENT RF-DETR
 # ============================================================================
 
-def train_rfdetr(dataset_name: str, epochs: int = None) -> str:
+def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: int = None) -> str:
     """
     Entraîne RF-DETR sur un dataset
-    
-    Args:
-        dataset_name: Nom du dataset
-        epochs: Nombre d'époques
-        
-    Returns:
-        Chemin vers le modèle entraîné
     """
     epochs = epochs or Config.EPOCHS
     
-    print(f"\n{'='*70}")
-    print(f"🚀 ENTRAÎNEMENT RF-DETR")
-    print(f"{'='*70}")
+    # Nombre de classes
+    num_classes = len(class_info.get("classes", class_info))
     
-    # 1. Télécharger le dataset
-    dataset_path = download_dataset_coco(dataset_name, Config.ROBOFLOW_API_KEY)
+    # ══════════════════════════════════════════════════════════════════════════
+    # AFFICHAGE DU GRAND RÉSUMÉ DE CONFIGURATION
+    # ══════════════════════════════════════════════════════════════════════════
+    print_full_config_summary(
+        dataset_name=model_name,
+        dataset_path=dataset_path,
+        num_classes=num_classes
+    )
     
-    # 2. Extraire les classes du dataset
-    categories = extract_classes_from_dataset(dataset_path)
-    print(f"\n📋 Classes détectées:")
-    class_info = {}
-    for cat in categories:
-        class_info[cat['id']] = {
-            'name': cat['name'],
-            'dataset': dataset_name,
-            'supercategory': cat.get('supercategory', '')
-        }
-        print(f"   ID {cat['id']}: {cat['name']}")
-    
-    # 3. Charger le modèle
+    # Charger le modèle
     model = get_model(Config.MODEL_SIZE)
     
-    # 4. Chemin de sortie
-    output_dir = Config.MODELS_DIR / dataset_name
+    # Chemin de sortie
+    output_dir = Config.MODELS_DIR / model_name
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 5. Sauvegarder le mapping des classes
-    save_class_mapping(output_dir, {dataset_name: Config.DATASETS[dataset_name]}, class_info)
+    # Sauvegarder le mapping des classes
+    datasets_used = list(class_info.get("source_datasets", {}).keys()) if "source_datasets" in class_info else [model_name]
+    save_class_mapping(output_dir, class_info, datasets_used)
     
-    # 6. Afficher la configuration
-    print(f"\n{'='*70}")
-    print(f"📊 CONFIGURATION D'ENTRAÎNEMENT")
-    print(f"{'='*70}")
-    print(f"   Device:           {Config.DEVICE}")
-    print(f"   Modèle:           RF-DETR-{Config.MODEL_SIZE.capitalize()}")
-    print(f"   Époques:          {epochs}")
-    print(f"   Batch size:       {Config.BATCH_SIZE}")
-    print(f"   Grad accum:       {Config.GRAD_ACCUM_STEPS}")
-    print(f"   Resolution:       {Config.RESOLUTION}")
-    print(f"   Learning rate:    {Config.LR:.2e}")
-    print(f"   Num workers:      {Config.NUM_WORKERS}")
-    print(f"   Dataset dir:      {dataset_path}")
-    print(f"   Output dir:       {output_dir}")
-    print(f"   Classes:          {len(class_info)}")
-    print(f"{'='*70}\n")
+    print(f"\n🏋️ Lancement de l'entraînement...")
     
-    # 7. Estimer le temps
-    if Config.DEVICE.startswith("cuda"):
-        time_estimate = f"~{epochs * 2} minutes"
-    elif Config.DEVICE == "mps":
-        time_estimate = f"~{epochs * 10} minutes"
-    else:
-        time_estimate = f"~{epochs * 60} minutes (CPU très lent!)"
+    # Construire les paramètres d'entraînement
+    train_params = {
+        "dataset_dir": str(dataset_path),
+        "epochs": epochs,
+        "batch_size": Config.BATCH_SIZE,
+        "grad_accum_steps": Config.GRAD_ACCUM_STEPS,
+        "lr": Config.LR,
+        "output_dir": str(output_dir),
+        "resolution": Config.RESOLUTION,
+        "device": Config.DEVICE,
+        "num_workers": Config.NUM_WORKERS,
+    }
     
-    print(f"🏋️ Début de l'entraînement...")
-    print(f"   Temps estimé: {time_estimate}\n")
+    # Ajouter early stopping si activé
+    if Config.EARLY_STOPPING:
+        train_params["early_stopping"] = True
+        train_params["early_stopping_patience"] = Config.EARLY_STOPPING_PATIENCE
+        train_params["early_stopping_min_delta"] = Config.EARLY_STOPPING_MIN_DELTA
     
-    # 8. Lancer l'entraînement
+    # Lancer l'entraînement
     try:
-        model.train(
-            dataset_dir=str(dataset_path),
-            epochs=epochs,
-            batch_size=Config.BATCH_SIZE,
-            grad_accum_steps=Config.GRAD_ACCUM_STEPS,
-            lr=Config.LR,
-            output_dir=str(output_dir),
-            resolution=Config.RESOLUTION,
-            device=Config.DEVICE,
-            num_workers=Config.NUM_WORKERS,
-        )
+        model.train(**train_params)
     except TypeError as e:
-        print(f"⚠️ Certains paramètres non supportés, utilisation config minimale")
+        print(f"⚠️ Certains paramètres non supportés, tentative sans early stopping...")
         print(f"   Erreur: {e}\n")
         model.train(
             dataset_dir=str(dataset_path),
@@ -491,7 +949,7 @@ def train_rfdetr(dataset_name: str, epochs: int = None) -> str:
             output_dir=str(output_dir),
         )
     
-    # 9. Trouver le meilleur modèle
+    # Trouver le meilleur modèle
     model_path = find_best_model(output_dir)
     
     print(f"\n{'='*70}")
@@ -534,8 +992,87 @@ def find_best_model(output_dir: Path) -> Path:
 
 
 # ============================================================================
-# 7. ÉVALUATION ET PRÉDICTION
+# 10. ÉVALUATION ET PRÉDICTION
 # ============================================================================
+
+def evaluate_model(model_path: str, dataset_path: Path) -> dict:
+    """Évalue le modèle sur le dataset de test"""
+    from PIL import Image
+    import numpy as np
+    
+    print(f"\n{'='*70}")
+    print(f"📊 ÉVALUATION DU MODÈLE")
+    print(f"{'='*70}")
+    
+    model = get_model(Config.MODEL_SIZE)
+    if model_path and Path(model_path).exists():
+        model = type(model)(pretrain_weights=str(model_path))
+        print(f"   ✅ Modèle chargé: {model_path}")
+    
+    mapping_file = Path(model_path).parent / "class_mapping.json"
+    class_names = {}
+    if mapping_file.exists():
+        with open(mapping_file, 'r') as f:
+            mapping = json.load(f)
+        for class_id, info in mapping.get('classes', {}).items():
+            class_names[int(class_id)] = info['name']
+    
+    test_dir = dataset_path / "test"
+    if not test_dir.exists():
+        test_dir = dataset_path / "valid"
+    
+    ann_file = test_dir / "_annotations.coco.json"
+    if not ann_file.exists():
+        print(f"   ❌ Pas de fichier d'annotations de test")
+        return {}
+    
+    with open(ann_file, 'r') as f:
+        coco_data = json.load(f)
+    
+    stats = {cat['id']: {
+        'name': cat['name'],
+        'total_gt': 0,
+        'total_pred': 0,
+        'correct': 0,
+        'confidences': []
+    } for cat in coco_data['categories']}
+    
+    annotations_by_image = {}
+    for ann in coco_data['annotations']:
+        img_id = ann['image_id']
+        if img_id not in annotations_by_image:
+            annotations_by_image[img_id] = []
+        annotations_by_image[img_id].append(ann)
+        stats[ann['category_id']]['total_gt'] += 1
+    
+    print(f"   📷 Évaluation sur {len(coco_data['images'])} images...")
+    
+    for img_info in coco_data['images']:
+        img_path = test_dir / img_info['file_name']
+        if not img_path.exists():
+            continue
+        
+        image = Image.open(img_path)
+        detections = model.predict(image, threshold=0.5)
+        
+        if len(detections) > 0 and hasattr(detections, 'class_id'):
+            for cls_id, conf in zip(detections.class_id, detections.confidence):
+                if cls_id in stats:
+                    stats[cls_id]['total_pred'] += 1
+                    stats[cls_id]['confidences'].append(float(conf))
+    
+    print(f"\n   {'─'*60}")
+    print(f"   {'Classe':<25} {'GT':>8} {'Pred':>8} {'Conf Moy':>12}")
+    print(f"   {'─'*60}")
+    
+    for cls_id, s in stats.items():
+        avg_conf = np.mean(s['confidences']) if s['confidences'] else 0
+        print(f"   {s['name']:<25} {s['total_gt']:>8} {s['total_pred']:>8} {avg_conf:>12.1%}")
+    
+    print(f"   {'─'*60}")
+    
+    return stats
+
 
 def predict_test(model_path: str = None, image_path: str = None, save_dir: str = None):
     """Test de prédiction rapide"""
@@ -549,7 +1086,6 @@ def predict_test(model_path: str = None, image_path: str = None, save_dir: str =
     
     model = get_model(Config.MODEL_SIZE)
     
-    # Charger le mapping des classes si disponible
     class_names = {}
     if model_path and Path(model_path).exists():
         mapping_file = Path(model_path).parent / "class_mapping.json"
@@ -566,7 +1102,6 @@ def predict_test(model_path: str = None, image_path: str = None, save_dir: str =
     else:
         print(f"   ℹ️ Utilisation du modèle pré-entraîné COCO")
     
-    # Image de test
     if image_path:
         if image_path.startswith("http"):
             response = requests.get(image_path)
@@ -581,8 +1116,8 @@ def predict_test(model_path: str = None, image_path: str = None, save_dir: str =
         print(f"   📷 Image de test (sanglier Wikipedia)")
     
     print(f"   📐 Taille: {image.size}")
+    print(f"   🎯 Résolution d'inférence: {Config.RESOLUTION} px")
     
-    # Prédiction
     detections = model.predict(image, threshold=0.5)
     
     print(f"\n   📦 {len(detections)} détection(s):")
@@ -598,61 +1133,90 @@ def predict_test(model_path: str = None, image_path: str = None, save_dir: str =
     return detections
 
 
-def export_for_jetson(model_path: str, formats: list = None):
-    """Exporte le modèle pour Jetson"""
-    formats = formats or ["onnx"]
-    
-    print(f"\n{'='*70}")
-    print(f"📤 EXPORT POUR JETSON ORIN")
-    print(f"{'='*70}")
-    print(f"   Modèle: {model_path}")
-    
-    model_file = Path(model_path)
-    if not model_file.exists():
-        print(f"   ❌ Modèle non trouvé")
-        return
-    
-    model = get_model(Config.MODEL_SIZE)
-    
-    output_dir = model_file.parent / "exports"
-    output_dir.mkdir(exist_ok=True)
-    
-    for fmt in formats:
-        try:
-            if fmt == "onnx":
-                export_path = output_dir / f"{model_file.stem}.onnx"
-                model.export(str(export_path))
-                print(f"   ✅ ONNX: {export_path}")
-        except Exception as e:
-            print(f"   ❌ Erreur export {fmt}: {e}")
-
-
 # ============================================================================
-# 8. FONCTIONS PRINCIPALES
+# 11. FONCTIONS PRINCIPALES
 # ============================================================================
 
-def train_single_model(dataset_name: str):
-    """Pipeline complet pour un dataset"""
+def train_single_dataset(dataset_name: str):
+    """Pipeline pour un seul dataset"""
     setup_directories()
     
-    model_path = train_rfdetr(dataset_name)
+    # Télécharger le dataset
+    dataset_path = download_dataset_coco(dataset_name, Config.ROBOFLOW_API_KEY)
     
+    # Extraire les classes
+    categories = extract_classes_from_dataset(dataset_path)
+    class_info = {"classes": {}}
+    for cat in categories:
+        class_info["classes"][cat['id']] = {
+            'name': cat['name'],
+            'supercategory': cat.get('supercategory', ''),
+            'source_datasets': [dataset_name]
+        }
+    
+    # Entraîner (le grand print est fait dans train_rfdetr)
+    model_path = train_rfdetr(dataset_path, dataset_name, class_info)
+    
+    # Évaluer
+    try:
+        evaluate_model(model_path, dataset_path)
+    except Exception as e:
+        print(f"⚠️ Erreur évaluation: {e}")
+    
+    # Test de prédiction
     try:
         predict_test(model_path)
     except Exception as e:
         print(f"⚠️ Erreur prédiction test: {e}")
     
-    if Config.EPOCHS > 5:
-        try:
-            export_for_jetson(model_path, ["onnx"])
-        except Exception as e:
-            print(f"⚠️ Erreur export: {e}")
+    return model_path
+
+
+def train_merged_datasets(dataset_names: List[str] = None):
+    """Pipeline pour fusionner et entraîner sur plusieurs datasets"""
+    setup_directories()
+    
+    if dataset_names is None:
+        dataset_names = list(Config.DATASETS.keys())
+    
+    print(f"\n{'='*70}")
+    print(f"🔀 MODE FUSION - {len(dataset_names)} datasets")
+    print(f"{'='*70}")
+    print(f"   Datasets: {', '.join(dataset_names)}")
+    
+    # Télécharger tous les datasets
+    dataset_paths = []
+    for name in dataset_names:
+        path = download_dataset_coco(name, Config.ROBOFLOW_API_KEY)
+        dataset_paths.append(path)
+    
+    # Fusionner les datasets
+    merged_path = Config.DATASETS_DIR / Config.MERGED_MODEL_NAME
+    class_info = merge_coco_datasets(dataset_paths, merged_path)
+    
+    # Afficher les stats du dataset fusionné
+    show_dataset_stats(merged_path)
+    
+    # Entraîner sur le dataset fusionné (le grand print est fait dans train_rfdetr)
+    model_path = train_rfdetr(merged_path, Config.MERGED_MODEL_NAME, class_info)
+    
+    # Évaluer sur le dataset fusionné
+    try:
+        evaluate_model(model_path, merged_path)
+    except Exception as e:
+        print(f"⚠️ Erreur évaluation: {e}")
+    
+    # Test de prédiction
+    try:
+        predict_test(model_path)
+    except Exception as e:
+        print(f"⚠️ Erreur prédiction test: {e}")
     
     return model_path
 
 
-def train_all_models():
-    """Entraîne tous les datasets du CSV"""
+def train_all_separate():
+    """Entraîne un modèle séparé pour chaque dataset"""
     models = {}
     setup_directories()
     
@@ -662,7 +1226,7 @@ def train_all_models():
             print(f"# DATASET: {dataset_name.upper()}")
             print(f"{'#'*70}")
             
-            model_path = train_rfdetr(dataset_name)
+            model_path = train_single_dataset(dataset_name)
             models[dataset_name] = model_path
             
         except Exception as e:
@@ -671,7 +1235,7 @@ def train_all_models():
             traceback.print_exc()
     
     print(f"\n{'='*70}")
-    print(f"📋 RÉSUMÉ")
+    print(f"📋 RÉSUMÉ FINAL")
     print(f"{'='*70}")
     for name, path in models.items():
         print(f"   ✅ {name}: {path}")
@@ -680,7 +1244,7 @@ def train_all_models():
 
 
 # ============================================================================
-# 9. POINT D'ENTRÉE
+# 12. POINT D'ENTRÉE
 # ============================================================================
 
 if __name__ == "__main__":
@@ -691,135 +1255,120 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Exemples:
-  # Sur Mac M4 Max (test rapide 1 epoch)
-  python train_rfdetr.py --api-key CLE --device mps --epochs 1
-  
-  # Sur RunPod avec GPU NVIDIA
-  python train_rfdetr.py --api-key CLE --device cuda
-  
-  # Avec fichier CSV custom
-  python train_rfdetr.py --api-key CLE --datasets-csv mes_datasets.csv
-  
-  # Entraîner un dataset spécifique
+  # Mode single: un modèle par dataset
   python train_rfdetr.py --api-key CLE --dataset sanglier
+  
+  # Mode merged: fusion de tous les datasets → un seul modèle
+  python train_rfdetr.py --api-key CLE --mode merged
+  
+  # Mode merged avec datasets spécifiques
+  python train_rfdetr.py --api-key CLE --mode merged --datasets sanglier,frelon
+  
+  # Configuration personnalisée
+  python train_rfdetr.py --api-key CLE --mode merged --resolution 728 --epochs 200
 
-Format du fichier CSV:
-  name,workspace,project,version
-  sanglier,corbin-helms-wghhy,wild-boar-detection-0igwx,1
-  frelon,use-case-asian-hornet-detection,asian-hornet-video-detection,1
+Format du fichier CSV (datasets.csv):
+  name,workspace,project,version,url
+  sanglier,mon-workspace,mon-projet,1,https://app.roboflow.com/...
+
+Modes d'entraînement:
+  single  : Un modèle par dataset (défaut)
+  merged  : Fusion des datasets → Un seul modèle multi-classes
+
+GPUs supportés:
+  - NVIDIA H200 SXM (141 GB)
+  - NVIDIA H100 (80 GB)
+  - NVIDIA A100 (40/80 GB)
+  - NVIDIA RTX 5090 (32 GB)
+  - NVIDIA RTX 4090 (24 GB)
+  - NVIDIA RTX 5080 (16 GB)
+  - NVIDIA RTX 3090 (24 GB)
+  - Apple Silicon (MPS)
+  - CPU (debug uniquement)
         """
     )
     
     # Arguments principaux
-    parser.add_argument(
-        "--dataset", 
-        type=str, 
-        default=None,
-        help="Dataset spécifique à entraîner (ou 'all' pour tous)"
-    )
-    parser.add_argument(
-        "--datasets-csv",
-        type=str,
-        default="datasets.csv",
-        help="Chemin vers le fichier CSV des datasets (défaut: datasets.csv)"
-    )
-    parser.add_argument(
-        "--api-key",
-        type=str,
-        required=False,
-        help="Clé API Roboflow"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Device: 'auto', 'cuda', 'cuda:0', 'mps', 'cpu' (défaut: auto)"
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
-        help="Nombre d'époques"
-    )
-    parser.add_argument(
-        "--batch",
-        type=int,
-        default=None,
-        help="Taille du batch"
-    )
-    parser.add_argument(
-        "--model-size",
-        type=str,
-        choices=["nano", "small", "base", "large"],
-        default=None,
-        help="Taille du modèle"
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=None,
-        help="Learning rate"
-    )
-    parser.add_argument(
-        "--resolution",
-        type=int,
-        default=None,
-        help="Résolution des images"
-    )
-    parser.add_argument(
-        "--grad-accum",
-        type=int,
-        default=None,
-        help="Gradient accumulation steps"
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=None,
-        help="Nombre de workers"
-    )
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Dataset spécifique (mode single) ou 'all'")
+    parser.add_argument("--datasets", type=str, default=None,
+                        help="Liste de datasets séparés par virgule (mode merged)")
+    parser.add_argument("--datasets-csv", type=str, default="datasets.csv",
+                        help="Chemin vers le fichier CSV des datasets")
+    parser.add_argument("--mode", type=str, choices=["single", "merged"], default="single",
+                        help="Mode: 'single' ou 'merged'")
+    parser.add_argument("--model-name", type=str, default="merged_model",
+                        help="Nom du modèle fusionné (mode merged)")
+    parser.add_argument("--api-key", type=str, required=False,
+                        help="Clé API Roboflow")
+    parser.add_argument("--device", type=str, default="auto",
+                        help="Device: 'auto', 'cuda', 'cuda:0', 'mps', 'cpu'")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Nombre d'époques max (défaut: 200)")
+    parser.add_argument("--batch", type=int, default=None,
+                        help="Taille du batch")
+    parser.add_argument("--model-size", type=str, choices=["nano", "small", "base", "large"],
+                        default=None, help="Taille du modèle")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Learning rate")
+    parser.add_argument("--resolution", type=int, default=None,
+                        help="Résolution des images (défaut: 728)")
+    parser.add_argument("--grad-accum", type=int, default=None,
+                        help="Gradient accumulation steps")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Nombre de workers")
+    
+    # Early stopping
+    parser.add_argument("--no-early-stopping", action="store_true",
+                        help="Désactiver l'early stopping")
+    parser.add_argument("--patience", type=int, default=None,
+                        help="Patience pour early stopping (défaut: 50)")
     
     # Modes spéciaux
-    parser.add_argument(
-        "--predict",
-        action="store_true",
-        help="Mode prédiction"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        help="Chemin vers le modèle (pour prédiction)"
-    )
-    parser.add_argument(
-        "--image",
-        type=str,
-        help="Image pour prédiction"
-    )
-    parser.add_argument(
-        "--list-datasets",
-        action="store_true",
-        help="Liste les datasets disponibles dans le CSV"
-    )
+    parser.add_argument("--predict", action="store_true",
+                        help="Mode prédiction")
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Mode évaluation")
+    parser.add_argument("--model", type=str,
+                        help="Chemin vers le modèle")
+    parser.add_argument("--image", type=str,
+                        help="Image pour prédiction")
+    parser.add_argument("--list-datasets", action="store_true",
+                        help="Liste les datasets avec URLs")
+    parser.add_argument("--show-config", action="store_true",
+                        help="Affiche la configuration sans lancer l'entraînement")
 
     args = parser.parse_args()
     
     # Charger les datasets depuis le CSV
     Config.DATASETS_CSV = Path(args.datasets_csv)
+    Config.TRAINING_MODE = args.mode
+    Config.MERGED_MODEL_NAME = args.model_name
     
     try:
         Config.DATASETS = load_datasets_from_csv(Config.DATASETS_CSV)
     except FileNotFoundError:
         if not args.list_datasets:
             print(f"\n💡 Créez le fichier {args.datasets_csv} avec le format:")
-            print(f"   name,workspace,project,version")
-            print(f"   sanglier,corbin-helms-wghhy,wild-boar-detection-0igwx,1")
+            print(f"   name,workspace,project,version,url")
+            print(f"   sanglier,mon-workspace,mon-projet,1,https://app.roboflow.com/...")
             exit(1)
     
-    # Mode liste des datasets
+    # Mode liste des datasets avec URLs
     if args.list_datasets:
-        print(f"\n📋 Datasets disponibles dans {Config.DATASETS_CSV}:")
+        print(f"\n{'='*70}")
+        print(f"📋 DATASETS DISPONIBLES ({Config.DATASETS_CSV})")
+        print(f"{'='*70}")
         for name, info in Config.DATASETS.items():
-            print(f"   • {name}: {info['workspace']}/{info['project']} v{info['version']}")
+            print(f"\n   📦 {name}")
+            print(f"      Workspace: {info['workspace']}")
+            print(f"      Project:   {info['project']}")
+            print(f"      Version:   {info['version']}")
+            if 'url' in info:
+                print(f"      🔗 URL:    {info['url']}")
+            if 'notes' in info:
+                print(f"      📝 Notes:  {info['notes']}")
+        print(f"\n{'='*70}")
         exit(0)
     
     # Détection du device et configuration auto
@@ -828,32 +1377,47 @@ Format du fichier CSV:
     # Override des paramètres si spécifiés
     if args.api_key:
         Config.ROBOFLOW_API_KEY = args.api_key
-    
     if args.epochs is not None:
         Config.EPOCHS = args.epochs
-    
     if args.batch is not None:
         Config.BATCH_SIZE = args.batch
-    
     if args.model_size is not None:
         Config.MODEL_SIZE = args.model_size
-    
     if args.lr is not None:
         Config.LR = args.lr
-    
     if args.resolution is not None:
         Config.RESOLUTION = args.resolution
-    
     if args.grad_accum is not None:
         Config.GRAD_ACCUM_STEPS = args.grad_accum
-    
     if args.workers is not None:
         Config.NUM_WORKERS = args.workers
+    if args.no_early_stopping:
+        Config.EARLY_STOPPING = False
+    if args.patience is not None:
+        Config.EARLY_STOPPING_PATIENCE = args.patience
+    
+    # Mode affichage config seulement
+    if args.show_config:
+        print_full_config_summary()
+        exit(0)
     
     # Mode prédiction
     if args.predict:
         setup_directories()
         predict_test(args.model, args.image)
+        exit(0)
+    
+    # Mode évaluation
+    if args.evaluate:
+        setup_directories()
+        if not args.model:
+            print("❌ --model requis pour l'évaluation")
+            exit(1)
+        model_dir = Path(args.model).parent
+        dataset_path = Config.DATASETS_DIR / model_dir.name
+        if not dataset_path.exists():
+            dataset_path = Config.DATASETS_DIR / Config.MERGED_MODEL_NAME
+        evaluate_model(args.model, dataset_path)
         exit(0)
     
     # Vérifier la clé API
@@ -866,40 +1430,46 @@ Format du fichier CSV:
         print("   ou: export ROBOFLOW_API_KEY=VOTRE_CLE")
         exit(1)
     
-    # Déterminer le dataset à entraîner
-    if args.dataset is None:
-        # Si un seul dataset dans le CSV, l'utiliser
-        if len(Config.DATASETS) == 1:
-            args.dataset = list(Config.DATASETS.keys())[0]
-            print(f"ℹ️ Un seul dataset dans le CSV, utilisation de: {args.dataset}")
-        else:
-            print(f"❌ Plusieurs datasets disponibles, spécifiez --dataset:")
-            for name in Config.DATASETS.keys():
-                print(f"   • {name}")
-            print(f"   • all (pour tous les entraîner)")
-            exit(1)
-    
-    # Vérifier que le dataset existe
-    if args.dataset != "all" and args.dataset not in Config.DATASETS:
-        print(f"❌ Dataset '{args.dataset}' non trouvé dans {Config.DATASETS_CSV}")
-        print(f"   Disponibles: {list(Config.DATASETS.keys())}")
-        exit(1)
-    
-    # Bannière
+    # Bannière de démarrage
     device_emoji = "🖥️" if Config.DEVICE.startswith("cuda") else "🍎" if Config.DEVICE == "mps" else "💻"
+    mode_emoji = "🔀" if args.mode == "merged" else "📦"
     
     print("\n")
     print("🐗" * 35)
     print("🐗" + " " * 66 + "🐗")
-    print("🐗" + "   RF-DETR TRAINING".center(66) + "🐗")
+    print("🐗" + "   RF-DETR TRAINING PIPELINE".center(66) + "🐗")
     print("🐗" + f"   {device_emoji} Device: {Config.DEVICE}".center(66) + "🐗")
-    print("🐗" + f"   📄 CSV: {Config.DATASETS_CSV}".center(66) + "🐗")
+    print("🐗" + f"   {mode_emoji} Mode: {args.mode}".center(66) + "🐗")
+    print("🐗" + f"   🎯 Resolution: {Config.RESOLUTION}px".center(66) + "🐗")
+    print("🐗" + f"   ⏱️  Epochs: {Config.EPOCHS} (patience: {Config.EARLY_STOPPING_PATIENCE})".center(66) + "🐗")
     print("🐗" + " " * 66 + "🐗")
     print("🐗" * 35)
     print("\n")
     
-    # Lancer l'entraînement
-    if args.dataset == "all":
-        train_all_models()
+    # Lancer l'entraînement selon le mode
+    if args.mode == "merged":
+        if args.datasets:
+            dataset_list = [d.strip() for d in args.datasets.split(",")]
+            for d in dataset_list:
+                if d not in Config.DATASETS:
+                    print(f"❌ Dataset '{d}' non trouvé dans {Config.DATASETS_CSV}")
+                    exit(1)
+            train_merged_datasets(dataset_list)
+        else:
+            train_merged_datasets()
     else:
-        train_single_model(args.dataset)
+        if args.dataset == "all":
+            train_all_separate()
+        elif args.dataset:
+            if args.dataset not in Config.DATASETS:
+                print(f"❌ Dataset '{args.dataset}' non trouvé")
+                print(f"   Disponibles: {list(Config.DATASETS.keys())}")
+                exit(1)
+            train_single_dataset(args.dataset)
+        else:
+            if len(Config.DATASETS) == 1:
+                train_single_dataset(list(Config.DATASETS.keys())[0])
+            else:
+                print(f"❌ Spécifiez --dataset ou utilisez --mode merged")
+                print(f"   Disponibles: {list(Config.DATASETS.keys())}")
+                exit(1)
