@@ -163,7 +163,7 @@ class Config:
     EPOCHS = 200
     BATCH_SIZE = 16
     GRAD_ACCUM_STEPS = 1
-    RESOLUTION = 728
+    RESOLUTION = 640
     DEVICE = "auto"
     LR = 1e-4
     NUM_WORKERS = 4
@@ -1608,7 +1608,7 @@ def _configure_cuda(device: str):
         Config.BATCH_SIZE = 32
         Config.GRAD_ACCUM_STEPS = 1
         Config.MODEL_SIZE = "large"
-        Config.RESOLUTION = 728
+        Config.RESOLUTION = 640
         Config.NUM_WORKERS = 16
         print(f"   → Configuration H200 SXM (141 GB)")
     
@@ -1617,7 +1617,7 @@ def _configure_cuda(device: str):
         Config.BATCH_SIZE = 16
         Config.GRAD_ACCUM_STEPS = 1
         Config.MODEL_SIZE = "large"
-        Config.RESOLUTION = 728
+        Config.RESOLUTION = 640
         Config.NUM_WORKERS = 12
         print(f"   → Configuration H100 (80 GB)")
     
@@ -1630,7 +1630,7 @@ def _configure_cuda(device: str):
             Config.BATCH_SIZE = 8
             Config.GRAD_ACCUM_STEPS = 2
         Config.MODEL_SIZE = "large"
-        Config.RESOLUTION = 728
+        Config.RESOLUTION = 640
         Config.NUM_WORKERS = 12
         print(f"   → Configuration A100 ({int(gpu_memory)} GB)")
     
@@ -1639,7 +1639,7 @@ def _configure_cuda(device: str):
         Config.BATCH_SIZE = 16
         Config.GRAD_ACCUM_STEPS = 1
         Config.MODEL_SIZE = "large"
-        Config.RESOLUTION = 728
+        Config.RESOLUTION = 640
         Config.NUM_WORKERS = 12
         print(f"   → Configuration RTX 5090 (32 GB GDDR7)")
     
@@ -1648,7 +1648,7 @@ def _configure_cuda(device: str):
         Config.BATCH_SIZE = 8
         Config.GRAD_ACCUM_STEPS = 2
         Config.MODEL_SIZE = "base"
-        Config.RESOLUTION = 728
+        Config.RESOLUTION = 640
         Config.NUM_WORKERS = 8
         print(f"   → Configuration RTX 4090 (24 GB)")
     
@@ -1657,7 +1657,7 @@ def _configure_cuda(device: str):
         Config.BATCH_SIZE = 8
         Config.GRAD_ACCUM_STEPS = 2
         Config.MODEL_SIZE = "base"
-        Config.RESOLUTION = 728
+        Config.RESOLUTION = 640
         Config.NUM_WORKERS = 8
         print(f"   → Configuration RTX 5080 (16 GB GDDR7)")
     
@@ -1666,7 +1666,7 @@ def _configure_cuda(device: str):
         Config.BATCH_SIZE = 4
         Config.GRAD_ACCUM_STEPS = 4
         Config.MODEL_SIZE = "base"
-        Config.RESOLUTION = 728
+        Config.RESOLUTION = 640
         Config.NUM_WORKERS = 8
         print(f"   → Configuration RTX 3090 (24 GB)")
     
@@ -1694,21 +1694,21 @@ def _configure_cuda(device: str):
             Config.BATCH_SIZE = 16
             Config.GRAD_ACCUM_STEPS = 1
             Config.MODEL_SIZE = "large"
-            Config.RESOLUTION = 728
+            Config.RESOLUTION = 640
             Config.NUM_WORKERS = 12
             print(f"   → Configuration GPU haute capacité ({int(gpu_memory)} GB)")
         elif gpu_memory >= 32:
             Config.BATCH_SIZE = 16
             Config.GRAD_ACCUM_STEPS = 1
             Config.MODEL_SIZE = "large"
-            Config.RESOLUTION = 728
+            Config.RESOLUTION = 640
             Config.NUM_WORKERS = 12
             print(f"   → Configuration GPU 32+ GB ({int(gpu_memory)} GB)")
         elif gpu_memory >= 20:
             Config.BATCH_SIZE = 8
             Config.GRAD_ACCUM_STEPS = 2
             Config.MODEL_SIZE = "base"
-            Config.RESOLUTION = 728
+            Config.RESOLUTION = 640
             Config.NUM_WORKERS = 8
             print(f"   → Configuration GPU 20+ GB ({int(gpu_memory)} GB)")
         elif gpu_memory >= 12:
@@ -2538,7 +2538,7 @@ Exemples:
   python train_rfdetr.py --api-key CLE --mode merged --datasets sanglier,frelon
   
   # Configuration personnalisée
-  python train_rfdetr.py --api-key CLE --mode merged --resolution 728 --epochs 200
+  python train_rfdetr.py --api-key CLE --mode merged --resolution 640 --epochs 200
   
   # Mode non-interactif (pas de questions)
   python train_rfdetr.py --api-key CLE --mode merged --no-interactive
@@ -2577,7 +2577,7 @@ Modes d'entraînement:
     parser.add_argument("--lr", type=float, default=None,
                         help="Learning rate")
     parser.add_argument("--resolution", type=int, default=None,
-                        help="Résolution des images (défaut: 728)")
+                        help="Résolution des images (défaut: 640)")
     parser.add_argument("--grad-accum", type=int, default=None,
                         help="Gradient accumulation steps")
     parser.add_argument("--workers", type=int, default=None,
