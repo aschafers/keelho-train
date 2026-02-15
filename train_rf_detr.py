@@ -17,6 +17,7 @@ import csv
 import shutil
 import torch
 import platform
+import time
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
@@ -150,16 +151,210 @@ def load_datasets_from_csv(csv_path: Path) -> dict:
 
 
 # ============================================================================
-# 4. FUSION DES DATASETS COCO
+# 4. VALIDATION ET CORRECTION DES DATASETS COCO
+# ============================================================================
+
+def validate_coco_dataset(dataset_path: Path) -> bool:
+    """
+    Valide que le dataset COCO a des category_id valides (continus à partir de 0)
+    
+    Cette validation est CRUCIALE pour éviter l'erreur CUDA:
+    "device-side assert triggered"
+    
+    Returns:
+        True si valide, False sinon
+    """
+    print(f"\n{'='*70}")
+    print(f"🔍 VALIDATION DU DATASET COCO")
+    print(f"{'='*70}")
+    print(f"   Chemin: {dataset_path}")
+    
+    issues = []
+    all_valid = True
+    
+    for split in ["train", "valid", "test"]:
+        ann_file = dataset_path / split / "_annotations.coco.json"
+        if not ann_file.exists():
+            continue
+        
+        with open(ann_file, 'r') as f:
+            coco = json.load(f)
+        
+        categories = coco.get("categories", [])
+        annotations = coco.get("annotations", [])
+        images = coco.get("images", [])
+        
+        # Vérifier les IDs de catégories
+        cat_ids = sorted([c["id"] for c in categories])
+        expected_ids = list(range(len(categories)))
+        
+        print(f"\n   📁 {split.upper()}:")
+        print(f"      Images:       {len(images)}")
+        print(f"      Annotations:  {len(annotations)}")
+        print(f"      Catégories:   {len(categories)}")
+        print(f"      IDs trouvés:  {cat_ids}")
+        print(f"      IDs attendus: {expected_ids}")
+        
+        # Vérifier si les IDs commencent à 0
+        if cat_ids and cat_ids[0] != 0:
+            issues.append(f"❌ {split}: Les category_id commencent à {cat_ids[0]} au lieu de 0")
+            print(f"      ⚠️  PROBLÈME: Les IDs ne commencent pas à 0!")
+            all_valid = False
+        
+        # Vérifier si les IDs sont continus
+        if cat_ids != expected_ids:
+            issues.append(f"❌ {split}: Les category_id ne sont pas continus: {cat_ids}")
+            print(f"      ⚠️  PROBLÈME: Les IDs ne sont pas continus!")
+            all_valid = False
+        
+        # Vérifier les annotations
+        annotation_cat_ids = set(ann["category_id"] for ann in annotations)
+        category_ids_set = set(cat_ids)
+        invalid_cats = annotation_cat_ids - category_ids_set
+        
+        if invalid_cats:
+            issues.append(f"❌ {split}: Annotations avec category_id invalides: {invalid_cats}")
+            print(f"      ⚠️  PROBLÈME: Annotations avec IDs invalides: {invalid_cats}")
+            all_valid = False
+        
+        # Afficher les catégories
+        if categories:
+            print(f"      Classes:")
+            for cat in categories:
+                print(f"         ID {cat['id']}: {cat['name']}")
+        
+        if all_valid:
+            print(f"      ✅ Valide!")
+    
+    if issues:
+        print(f"\n{'='*70}")
+        print(f"❌ PROBLÈMES DÉTECTÉS ({len(issues)}):")
+        print(f"{'='*70}")
+        for issue in issues:
+            print(f"   {issue}")
+        print(f"\n💡 Ces problèmes causent l'erreur CUDA 'device-side assert triggered'")
+        print(f"   Le script va corriger automatiquement les IDs...")
+        return False
+    
+    print(f"\n✅ Dataset COCO valide! Les category_id sont corrects (0, 1, 2, ...)")
+    return True
+
+
+def fix_coco_category_ids(dataset_path: Path) -> Dict:
+    """
+    Corrige les category_id pour qu'ils soient continus à partir de 0
+    
+    Cette correction est ESSENTIELLE pour éviter l'erreur CUDA.
+    
+    Returns:
+        Dictionnaire avec le mapping old_id -> new_id
+    """
+    print(f"\n{'='*70}")
+    print(f"🔧 CORRECTION DES CATEGORY_ID")
+    print(f"{'='*70}")
+    
+    global_mapping = {}
+    
+    for split in ["train", "valid", "test"]:
+        ann_file = dataset_path / split / "_annotations.coco.json"
+        if not ann_file.exists():
+            continue
+        
+        with open(ann_file, 'r') as f:
+            coco = json.load(f)
+        
+        categories = coco.get("categories", [])
+        annotations = coco.get("annotations", [])
+        
+        if not categories:
+            continue
+        
+        # Créer le mapping old_id -> new_id (continu à partir de 0)
+        old_ids = sorted([c["id"] for c in categories])
+        id_mapping = {old_id: new_id for new_id, old_id in enumerate(old_ids)}
+        
+        print(f"\n   📁 {split.upper()}:")
+        print(f"      Mapping: {old_ids} → {list(range(len(old_ids)))}")
+        
+        # Sauvegarder le mapping global
+        for old_id, new_id in id_mapping.items():
+            cat_name = next((c["name"] for c in categories if c["id"] == old_id), "unknown")
+            global_mapping[old_id] = {"new_id": new_id, "name": cat_name}
+            print(f"         {old_id} → {new_id} ({cat_name})")
+        
+        # Mettre à jour les catégories
+        for cat in categories:
+            cat["id"] = id_mapping[cat["id"]]
+        
+        # Mettre à jour les annotations
+        updated_count = 0
+        for ann in annotations:
+            old_cat_id = ann["category_id"]
+            if old_cat_id in id_mapping:
+                ann["category_id"] = id_mapping[old_cat_id]
+                updated_count += 1
+        
+        print(f"      Annotations mises à jour: {updated_count}")
+        
+        # Créer un backup avant de modifier
+        backup_file = ann_file.with_suffix('.json.backup')
+        if not backup_file.exists():
+            shutil.copy(ann_file, backup_file)
+            print(f"      💾 Backup créé: {backup_file.name}")
+        
+        # Sauvegarder le fichier corrigé
+        with open(ann_file, 'w') as f:
+            json.dump(coco, f, indent=2)
+        
+        print(f"      ✅ Fichier corrigé sauvegardé!")
+    
+    print(f"\n✅ Correction terminée!")
+    print(f"   Les category_id sont maintenant continus à partir de 0")
+    
+    return global_mapping
+
+
+def ensure_valid_coco_dataset(dataset_path: Path) -> bool:
+    """
+    S'assure que le dataset COCO est valide, corrige si nécessaire.
+    
+    Returns:
+        True si le dataset est valide (ou a été corrigé avec succès)
+    """
+    # Première validation
+    if validate_coco_dataset(dataset_path):
+        return True
+    
+    # Correction automatique
+    print("\n⚠️ Dataset invalide détecté, correction automatique en cours...")
+    fix_coco_category_ids(dataset_path)
+    
+    # Re-validation après correction
+    print("\n🔄 Re-validation après correction...")
+    if validate_coco_dataset(dataset_path):
+        print("✅ Dataset corrigé avec succès!")
+        return True
+    else:
+        print("❌ Échec de la correction automatique!")
+        return False
+
+
+# ============================================================================
+# 5. FUSION DES DATASETS COCO
 # ============================================================================
 
 def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
     """
-    Fusionne plusieurs datasets COCO en un seul
+    Fusionne plusieurs datasets COCO en un seul avec des category_id valides
     """
     print(f"\n{'='*70}")
     print(f"🔀 FUSION DES DATASETS")
     print(f"{'='*70}")
+    
+    # D'abord, valider/corriger chaque dataset source
+    print("\n📋 Validation des datasets sources...")
+    for dataset_path in dataset_paths:
+        ensure_valid_coco_dataset(dataset_path)
     
     merged = {
         "train": {"images": [], "annotations": [], "categories": []},
@@ -313,6 +508,10 @@ def merge_coco_datasets(dataset_paths: List[Path], output_path: Path) -> Dict:
         sources = class_mapping["classes"][cat_id]["source_datasets"]
         print(f"   ID {cat_id}: {name} (depuis: {', '.join(sources)})")
     
+    # Valider le dataset fusionné
+    print("\n🔍 Validation du dataset fusionné...")
+    ensure_valid_coco_dataset(output_path)
+    
     return class_mapping
 
 
@@ -332,7 +531,7 @@ def extract_classes_from_dataset(dataset_path: Path) -> list:
 
 
 # ============================================================================
-# 5. SAUVEGARDE DU MAPPING DES CLASSES
+# 6. SAUVEGARDE DU MAPPING DES CLASSES
 # ============================================================================
 
 def save_class_mapping(output_dir: Path, class_info: dict, datasets_used: list = None):
@@ -368,7 +567,7 @@ def save_class_mapping(output_dir: Path, class_info: dict, datasets_used: list =
 
 
 # ============================================================================
-# 6. DÉTECTION ET CONFIGURATION DU DEVICE
+# 7. DÉTECTION ET CONFIGURATION DU DEVICE
 # ============================================================================
 
 def get_available_device() -> str:
@@ -589,7 +788,7 @@ def _configure_cpu():
 
 
 # ============================================================================
-# 7. AFFICHAGE DE LA CONFIGURATION (GRAND PRINT)
+# 8. AFFICHAGE DE LA CONFIGURATION (GRAND PRINT)
 # ============================================================================
 
 def print_full_config_summary(dataset_name: str = None, dataset_path: Path = None, num_classes: int = None):
@@ -773,7 +972,6 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
     print("\n")
     
     # Pause de 3 secondes pour lire
-    import time
     print("⏳ Démarrage dans 3 secondes... (Ctrl+C pour annuler)")
     for i in range(3, 0, -1):
         print(f"   {i}...")
@@ -782,7 +980,7 @@ def print_full_config_summary(dataset_name: str = None, dataset_path: Path = Non
 
 
 # ============================================================================
-# 8. FONCTIONS UTILITAIRES
+# 9. FONCTIONS UTILITAIRES
 # ============================================================================
 
 def setup_directories():
@@ -881,7 +1079,7 @@ def show_dataset_stats(dataset_path: Path):
 
 
 # ============================================================================
-# 9. ENTRAÎNEMENT RF-DETR
+# 10. ENTRAÎNEMENT RF-DETR
 # ============================================================================
 
 def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: int = None) -> str:
@@ -890,8 +1088,28 @@ def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: 
     """
     epochs = epochs or Config.EPOCHS
     
-    # Nombre de classes
-    num_classes = len(class_info.get("classes", class_info))
+    # ══════════════════════════════════════════════════════════════════════════
+    # VALIDATION ET CORRECTION DU DATASET COCO (CRITIQUE!)
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"\n{'='*70}")
+    print(f"🔒 VÉRIFICATION PRÉ-ENTRAÎNEMENT")
+    print(f"{'='*70}")
+    
+    if not ensure_valid_coco_dataset(dataset_path):
+        raise ValueError(f"❌ Dataset COCO invalide et impossible à corriger: {dataset_path}")
+    
+    # Nombre de classes (re-extraire après correction éventuelle)
+    categories = extract_classes_from_dataset(dataset_path)
+    num_classes = len(categories)
+    
+    # Mettre à jour class_info avec les IDs corrigés
+    class_info = {"classes": {}}
+    for cat in categories:
+        class_info["classes"][cat['id']] = {
+            'name': cat['name'],
+            'supercategory': cat.get('supercategory', ''),
+            'source_datasets': [model_name]
+        }
     
     # ══════════════════════════════════════════════════════════════════════════
     # AFFICHAGE DU GRAND RÉSUMÉ DE CONFIGURATION
@@ -914,6 +1132,8 @@ def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: 
     save_class_mapping(output_dir, class_info, datasets_used)
     
     print(f"\n🏋️ Lancement de l'entraînement...")
+    print(f"   Classes: {num_classes}")
+    print(f"   IDs: {list(class_info['classes'].keys())}")
     
     # Construire les paramètres d'entraînement
     train_params = {
@@ -992,7 +1212,7 @@ def find_best_model(output_dir: Path) -> Path:
 
 
 # ============================================================================
-# 10. ÉVALUATION ET PRÉDICTION
+# 11. ÉVALUATION ET PRÉDICTION
 # ============================================================================
 
 def evaluate_model(model_path: str, dataset_path: Path) -> dict:
@@ -1134,7 +1354,7 @@ def predict_test(model_path: str = None, image_path: str = None, save_dir: str =
 
 
 # ============================================================================
-# 11. FONCTIONS PRINCIPALES
+# 12. FONCTIONS PRINCIPALES
 # ============================================================================
 
 def train_single_dataset(dataset_name: str):
@@ -1144,7 +1364,7 @@ def train_single_dataset(dataset_name: str):
     # Télécharger le dataset
     dataset_path = download_dataset_coco(dataset_name, Config.ROBOFLOW_API_KEY)
     
-    # Extraire les classes
+    # Extraire les classes (sera re-validé dans train_rfdetr)
     categories = extract_classes_from_dataset(dataset_path)
     class_info = {"classes": {}}
     for cat in categories:
@@ -1154,7 +1374,7 @@ def train_single_dataset(dataset_name: str):
             'source_datasets': [dataset_name]
         }
     
-    # Entraîner (le grand print est fait dans train_rfdetr)
+    # Entraîner (validation + grand print sont fait dans train_rfdetr)
     model_path = train_rfdetr(dataset_path, dataset_name, class_info)
     
     # Évaluer
@@ -1190,14 +1410,14 @@ def train_merged_datasets(dataset_names: List[str] = None):
         path = download_dataset_coco(name, Config.ROBOFLOW_API_KEY)
         dataset_paths.append(path)
     
-    # Fusionner les datasets
+    # Fusionner les datasets (inclut validation/correction)
     merged_path = Config.DATASETS_DIR / Config.MERGED_MODEL_NAME
     class_info = merge_coco_datasets(dataset_paths, merged_path)
     
     # Afficher les stats du dataset fusionné
     show_dataset_stats(merged_path)
     
-    # Entraîner sur le dataset fusionné (le grand print est fait dans train_rfdetr)
+    # Entraîner sur le dataset fusionné (validation + grand print dans train_rfdetr)
     model_path = train_rfdetr(merged_path, Config.MERGED_MODEL_NAME, class_info)
     
     # Évaluer sur le dataset fusionné
@@ -1244,7 +1464,7 @@ def train_all_separate():
 
 
 # ============================================================================
-# 12. POINT D'ENTRÉE
+# 13. POINT D'ENTRÉE
 # ============================================================================
 
 if __name__ == "__main__":
@@ -1266,6 +1486,9 @@ Exemples:
   
   # Configuration personnalisée
   python train_rfdetr.py --api-key CLE --mode merged --resolution 728 --epochs 200
+  
+  # Valider un dataset sans entraîner
+  python train_rfdetr.py --validate-only --dataset sanglier
 
 Format du fichier CSV (datasets.csv):
   name,workspace,project,version,url
@@ -1337,6 +1560,8 @@ GPUs supportés:
                         help="Liste les datasets avec URLs")
     parser.add_argument("--show-config", action="store_true",
                         help="Affiche la configuration sans lancer l'entraînement")
+    parser.add_argument("--validate-only", action="store_true",
+                        help="Valide/corrige le dataset sans entraîner")
 
     args = parser.parse_args()
     
@@ -1399,6 +1624,27 @@ GPUs supportés:
     # Mode affichage config seulement
     if args.show_config:
         print_full_config_summary()
+        exit(0)
+    
+    # Mode validation seulement
+    if args.validate_only:
+        setup_directories()
+        if not Config.ROBOFLOW_API_KEY:
+            Config.ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "")
+        if not Config.ROBOFLOW_API_KEY:
+            print("❌ Clé API Roboflow requise pour télécharger les datasets")
+            exit(1)
+        
+        if args.dataset:
+            dataset_path = download_dataset_coco(args.dataset, Config.ROBOFLOW_API_KEY)
+            ensure_valid_coco_dataset(dataset_path)
+        else:
+            for name in Config.DATASETS.keys():
+                print(f"\n{'='*70}")
+                print(f"📦 Dataset: {name}")
+                print(f"{'='*70}")
+                dataset_path = download_dataset_coco(name, Config.ROBOFLOW_API_KEY)
+                ensure_valid_coco_dataset(dataset_path)
         exit(0)
     
     # Mode prédiction
