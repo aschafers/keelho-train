@@ -25,6 +25,8 @@ import torch
 import platform
 import time
 from datetime import datetime
+import wandb
+import signal
 from typing import Dict, List, Tuple, Optional, Set
 
 # ============================================================================
@@ -2068,6 +2070,13 @@ def setup_directories():
     Config.MODELS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"✅ Dossiers créés dans {Config.BASE_DIR}")
 
+def check_stop_file() -> bool:
+    """Vérifie si l'utilisateur demande l'arrêt via fichier STOP_TRAINING"""
+    stop_file = Config.BASE_DIR / "STOP_TRAINING"
+    if stop_file.exists():
+        print("\n🛑 Fichier STOP_TRAINING détecté - Arrêt demandé par l'utilisateur")
+        return True
+    return False
 
 def get_model(model_size: str = None):
     """Charge le modèle RF-DETR"""
@@ -2297,7 +2306,34 @@ def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: 
         "device": Config.DEVICE,
         "num_workers": Config.NUM_WORKERS,
     }
+    # === WANDB ===
+    # Initialiser wandb si disponible
+    wandb_run = None
+    try:
+        wandb_run = wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "rf-detr-detection"),
+            name=model_name,
+            config={
+                "model_size": Config.MODEL_SIZE,
+                "epochs": epochs,
+                "batch_size": Config.BATCH_SIZE,
+                "learning_rate": Config.LR,
+                "resolution": Config.RESOLUTION,
+                "num_classes": num_classes,
+                "dataset": model_name,
+            },
+            resume="allow",
+        )
+        print(f"   📊 Wandb initialisé: {wandb_run.url}")
+    except Exception as e:
+        print(f"   ⚠️  Wandb non disponible: {e}")
+        print(f"   💡 Pour activer: pip install wandb && wandb login")
     
+    # Dans train_rfdetr, après la création de train_params
+    if args.resume and Path(args.resume).exists():
+        train_params["resume"] = args.resume
+        print(f"   🔄 Reprise depuis: {args.resume}")
+
     # Ajouter early stopping si activé
     if Config.EARLY_STOPPING:
         train_params["early_stopping"] = True
@@ -2725,7 +2761,8 @@ Modes d'entraînement:
                         help="Affiche la configuration sans lancer l'entraînement")
     parser.add_argument("--validate-only", action="store_true",
                         help="Valide/corrige le dataset sans entraîner")
-
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Chemin vers checkpoint pour reprendre l'entraînement")
     args = parser.parse_args()
     
     # Charger les datasets depuis le CSV

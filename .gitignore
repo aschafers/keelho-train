@@ -5,3 +5,4 @@ yolo11n.pt
 projet_detection/*
 *.pth
 projet_detection_rfdetr/*
+start.sh
