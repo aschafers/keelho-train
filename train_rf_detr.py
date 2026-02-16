@@ -2340,6 +2340,10 @@ def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: 
         train_params["early_stopping_patience"] = Config.EARLY_STOPPING_PATIENCE
         train_params["early_stopping_min_delta"] = Config.EARLY_STOPPING_MIN_DELTA
     
+    train_params["pin_memory"] = True
+    train_params["persistent_workers"] = True
+    train_params["prefetch_factor"] = 4
+
     # Lancer l'entraînement
     try:
         model.train(**train_params)
@@ -2353,6 +2357,9 @@ def train_rfdetr(dataset_path: Path, model_name: str, class_info: dict, epochs: 
             grad_accum_steps=Config.GRAD_ACCUM_STEPS,
             lr=Config.LR,
             output_dir=str(output_dir),
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=4
         )
     
     # Trouver le meilleur modèle
