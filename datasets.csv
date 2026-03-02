@@ -1,10 +1,3 @@
 name,workspace,project,version,url,notes
 sanglier,corbin-helms-wghhy,wild-boar-detection-0igwx,1,"https://universe.roboflow.com/corbin-helms-wghhy/wild-boar-detection-0igwx",
-bee-hornet,use-case-asian-hornet-detection,asian-hornet-video-detection,1,https://universe.roboflow.com/use-case-asian-hornet-detection/asian-hornet-video-detection,
-cats,testing-uipb1,cats-rj3nm,1,https://universe.roboflow.com/testing-uipb1/cats-rj3nm,
-dogs,inno-ebzty,dogs-yqfhd,1,https://universe.roboflow.com/inno-ebzty/dogs-yqfhd,
-human,keke,person-fzqgw,12,https://universe.roboflow.com/keke/person-fzqgw,
-sheep,sheep-ztpnd,sheep-8aq3a,3,https://universe.roboflow.com/sheep-ztpnd/sheep-8aq3a,
-goat,karthik-a3uja,goat-olvnd,1,https://universe.roboflow.com/karthik-a3uja/goat-olvnd,
-bird,turtlee,bird-hkwll,1,https://universe.roboflow.com/turtlee/bird-hkwll,
-rat,rats-2lftk,rat-detection-xbnjq,1,https://universe.roboflow.com/rats-2lftk/rat-detection-xbnjq,
+human,dataset-uutxr,cctv-naxyo,2,"https://universe.roboflow.com/dataset-uutxr/cctv-naxyo",
